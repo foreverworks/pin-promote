@@ -2,18 +2,25 @@
 
 One promotion, in order:
 
-1. Every check the named channels require has passed (`checks.missing`), or nothing happens.
-2. Each new pin value fully matches its field's pattern, and the channel's fields are all given.
-3. Fetch the branch. The build's commit must be on it: a build of another branch never promotes.
-4. A channel whose pin already holds these values is unchanged: a retry commits nothing.
-5. For every channel that does change: no file of its sources, the shared sources or its own pin
-   changed between the build's commit and the branch's tip. Otherwise the build is stale and the
-   whole promotion is refused, before any commit.
-6. Write the pins (and a journal entry) in a temporary worktree of the branch's tip, commit, push.
-   Never a force push: a push the remote refuses, because the branch moved meanwhile, is tried again
-   from the new tip, steps 3 to 6 included, up to `attempts` times.
+1. Fetch the branch, and read the config at its tip (`git show <tip>:<config path>`). The config at
+   the tip governs everything after: its checks, fields, sources, journal, subject and registry.
+2. Every check the named channels require has passed (`checks.missing`), or nothing happens.
+3. Each new pin value fully matches its field's pattern, and the channel's fields are all given.
+4. The build's commit must be on the branch: a build of another branch never promotes.
+5. A channel whose pin already holds these values is unchanged: a retry commits nothing.
+6. For every channel that does change, one `git diff` per class of source, each of which must find
+   no file changed between the build's commit and the branch's tip: the channel's own `sources`
+   (its `:!` exclusions apply inside this list only), the `shared_sources`, and the channel's pin
+   file (a literal path). Otherwise the build is stale and the whole promotion is refused, before
+   any commit.
+7. Write the pins (and a journal entry) in a temporary worktree of the branch's tip, commit, push.
+   Never a force push. A push the remote refuses is tried again, after a pause, only when the branch
+   moved meanwhile (from the new tip, steps 1 to 7 again, up to `attempts` times); a push refused
+   while the branch stood still (a hook, a permission, a protected branch) fails at once with git's
+   own message.
 
 The caller's own checkout is never modified: the commit is made in a worktree that is removed after.
+The fetch does update the remote-tracking ref (`refs/remotes/<remote>/<branch>`).
 """
 
 import json
@@ -21,15 +28,20 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import NotRequired, TypedDict, cast
 
 from . import checks
-from .config import Channel, Config, sources
+from .config import Channel, Config, ConfigError, parse, source_classes
 
 SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 AUTHOR = re.compile(r"(?P<name>[^<>\n]+?) <(?P<email>[^<>\s]+)>")
+SHALLOW = "the history may be shallow: fetch the whole history (actions/checkout fetch-depth: 0)"
+REGULAR_FILE = ("100644", "100755")
+MAX_PAUSE = 8.0
 
 
 class PromotionError(ValueError):
@@ -54,6 +66,12 @@ class Edit(TypedDict):
     path: str
     current: str  # the file on the branch, "" when it does not exist yet
     updated: str
+
+
+class Pushed(TypedDict):
+    ok: bool
+    commit: str
+    error: str  # git push's own stderr when it refused
 
 
 class Result(TypedDict):
@@ -135,12 +153,46 @@ def journal_entry(config: Config, request: Request, names: list[str], passed: li
 # ---- git ------------------------------------------------------------------------------------------
 
 
+def _entry(repo: Path, ref: str, path: str) -> tuple[str, str] | None:
+    """(mode, type) of `path` at `ref`; None only when git lists nothing there. Any git error raises."""
+    listed = git(repo, "--literal-pathspecs", "ls-tree", ref, "--", path)
+    if not listed:
+        return None
+    mode, kind = listed.partition("\t")[0].split()[:2]
+    return mode, kind
+
+
 def _show(repo: Path, ref: str, path: str) -> str:
-    try:
-        git(repo, "cat-file", "-e", f"{ref}:{path}")
-    except GitError:
+    """The file at `ref`, with a final newline; "" when the path is absent there."""
+    entry = _entry(repo, ref, path)
+    if entry is None:
         return ""
+    if entry[1] != "blob":
+        raise GitError(f"{path} at {ref} is not a file")
     return git(repo, "show", f"{ref}:{path}") + "\n"
+
+
+def tip_config(repo: Path, ref: str, config_path: str, local: Config) -> Config:
+    """The config as the branch's tip holds it; PromotionError when it is missing, invalid or moves the branch."""
+    where = f"{config_path} at the tip of {local['branch']}"
+    entry = _entry(repo, ref, config_path)
+    if entry is None:
+        raise PromotionError(f"{where}: the config is missing there")
+    if entry[0] not in REGULAR_FILE:
+        raise PromotionError(f"{where}: not a regular file")
+    try:
+        config = parse(json.loads(git(repo, "show", f"{ref}:{config_path}")), config_path)
+    except json.JSONDecodeError as error:
+        raise PromotionError(f"{where}: not JSON: {error}") from error
+    except ConfigError as error:
+        raise PromotionError(f"{where} is not valid:\n{error}") from error
+    for key, theirs, ours in (
+        ("branch", config["branch"], local["branch"]),
+        ("remote", config["remote"], local["remote"]),
+    ):
+        if theirs != ours:
+            raise PromotionError(f"{where}: its {key} is {theirs!r}, the local config's is {ours!r}")
+    return config
 
 
 def edits(repo: Path, config: Config, request: Request, ref: str) -> list[Edit]:
@@ -161,16 +213,42 @@ def edits(repo: Path, config: Config, request: Request, ref: str) -> list[Edit]:
     return out
 
 
-def stale(repo: Path, build: str, ref: str, pathspecs: list[str]) -> list[str]:
-    """The files of these pathspecs that changed between the build's commit and `ref`."""
-    changed = git(repo, "diff", "--name-only", "--no-renames", build, ref, "--", *pathspecs)
+def stale(repo: Path, build: str, ref: str, pathspecs: list[str], *, literal: bool = False) -> list[str]:
+    """The files of these pathspecs that changed between the build's commit and `ref`.
+
+    Never called with no pathspec: `git diff` with none selects everything."""
+    if not pathspecs:
+        return []
+    mode = ["--literal-pathspecs"] if literal else []
+    changed = git(
+        repo, *mode, "diff", "--name-only", "--no-renames", "--ignore-submodules=none", build, ref, "--", *pathspecs
+    )
     return changed.splitlines()
 
 
-def _fetch(repo: Path, config: Config) -> str:
+def stale_files(repo: Path, config: Config, channel: Channel, build: str, ref: str) -> tuple[str, list[str]]:
+    """(what changed, the files), the first class of the three that holds a file; ("", []) when none does."""
+    classes = source_classes(config, channel)
+    for label, specs, literal in (
+        ("its sources", classes["own"], False),
+        ("the shared sources", classes["shared"], False),
+        ("its pin", [classes["pin"]], True),
+    ):
+        changed = stale(repo, build, ref, specs, literal=literal)
+        if changed:
+            return label, changed
+    return "", []
+
+
+def fetch(repo: Path, config: Config) -> str:
+    """Fetch the branch into its remote-tracking ref (nothing else changes); that ref's name."""
     remote, branch = config["remote"], config["branch"]
     git(repo, "fetch", "--quiet", remote, f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}")
     return f"refs/remotes/{remote}/{branch}"
+
+
+def _shallow_hint(repo: Path) -> str:
+    return f"; {SHALLOW}" if git(repo, "rev-parse", "--is-shallow-repository") == "true" else ""
 
 
 def _on_branch(repo: Path, build: str, ref: str) -> bool:
@@ -178,7 +256,7 @@ def _on_branch(repo: Path, build: str, ref: str) -> bool:
         ["git", "-C", str(repo), "merge-base", "--is-ancestor", build, ref], capture_output=True, check=False
     )
     if done.returncode not in (0, 1):
-        raise PromotionError(f"the build's commit {build} is not in this repository")
+        raise PromotionError(f"the build's commit {build} is not in this repository{_shallow_hint(repo)}")
     return done.returncode == 0
 
 
@@ -191,24 +269,38 @@ def _identity(author: str | None) -> list[str]:
     return ["-c", f"user.name={match['name']}", "-c", f"user.email={match['email']}"]
 
 
+def _target(tree: Path, relative: str) -> Path:
+    """Where to write `relative` in the worktree; PromotionError when a symlink is on the way (or out of it)."""
+    walked = tree
+    for part in PurePosixPath(relative).parts:
+        walked = walked / part
+        if walked.is_symlink():
+            raise PromotionError(f"{relative}: {part} is a symlink on the branch; nothing is written through one")
+        if not walked.exists():
+            break
+    if not (tree / relative).resolve().is_relative_to(tree.resolve()):
+        raise PromotionError(f"{relative}: resolves outside the repository; nothing is written there")
+    return tree / relative
+
+
 def _commit_and_push(
     repo: Path, config: Config, ref: str, changes: list[Edit], journal: str, text: str, author: str | None
-) -> tuple[bool, str]:
-    """(pushed, commit). The worktree is gone when this returns, whatever happened."""
+) -> Pushed:
+    """The push's outcome and the commit made. The worktree is gone when this returns, whatever happened."""
     scratch = Path(tempfile.mkdtemp(prefix="pin-promote-"))
     tree = scratch / "tree"
     try:
         git(repo, "worktree", "add", "--quiet", "--detach", str(tree), ref)
         for change in changes:
-            target = tree / change["path"]
+            target = _target(tree, change["path"])
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(change["updated"], encoding="utf-8")
         for name in config["journal"]:
-            target = tree / name
+            target = _target(tree, name)
             target.parent.mkdir(parents=True, exist_ok=True)
             with target.open("a", encoding="utf-8") as handle:
                 handle.write(journal)
-        git(tree, "add", "--", *[c["path"] for c in changes], *config["journal"])
+        git(tree, "--literal-pathspecs", "add", "--", *[c["path"] for c in changes], *config["journal"])
         identity = _identity(author)
         done = subprocess.run(
             ["git", "-C", str(tree), *identity, "commit", "--quiet", "-F", "-"],
@@ -226,7 +318,7 @@ def _commit_and_push(
             capture_output=True,
             check=False,
         )
-        return pushed.returncode == 0, commit
+        return {"ok": pushed.returncode == 0, "commit": commit, "error": pushed.stderr.strip()}
     finally:
         subprocess.run(
             ["git", "-C", str(repo), "worktree", "remove", "--force", str(tree)], capture_output=True, check=False
@@ -235,65 +327,99 @@ def _commit_and_push(
         subprocess.run(["git", "-C", str(repo), "worktree", "prune"], capture_output=True, check=False)
 
 
-def promote(repo: Path, config: Config, request: Request, *, log: list[str] | None = None) -> Result:
-    """Promote the requested pins; PromotionError when refused (nothing pushed)."""
+def _pause(attempt: int) -> float:
+    """Seconds to wait before attempt+1: 1, 2, 4, then 8 at most."""
+    return min(2.0 ** (attempt - 1), MAX_PAUSE)
+
+
+def promote(
+    repo: Path,
+    config: Config,
+    config_path: str,
+    request: Request,
+    *,
+    log: list[str] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Result:
+    """Promote the requested pins; PromotionError when refused (nothing pushed).
+
+    `config` is the local config, used only for the remote, the branch and the attempts: on every
+    attempt the config at the branch's tip, read from `config_path` (repository-relative), governs."""
     notes = log if log is not None else []
     names = list(request["pins"])
     if not names:
         raise PromotionError("no pin to promote")
-    unknown = sorted(set(names) - set(config["channels"]))
-    if unknown:
-        raise PromotionError(f"no such channel: {', '.join(unknown)}")
     build = request["build"]
     if not SHA.fullmatch(build):
         raise PromotionError(f"the build's commit must be a full hex object name: {build!r}")
-    required = required_checks(config, names)
-    failed = checks.missing(required, request["results"])
-    if failed:
-        raise PromotionError(f"checks not passed: {', '.join(failed)}")
     _identity(request.get("author"))
-    for name in names:  # values first: a bad value is refused before any network
-        pin_text(config["channels"][name], request["pins"][name])
     day = datetime.now(UTC).date().isoformat()
-    for attempt in range(1, config["attempts"] + 1):
-        ref = _fetch(repo, config)
+    attempts = config["attempts"]
+    for attempt in range(1, attempts + 1):
+        ref = fetch(repo, config)
+        tip = git(repo, "rev-parse", ref)
+        governing = tip_config(repo, ref, config_path, config)
+        unknown = sorted(set(names) - set(governing["channels"]))
+        if unknown:
+            raise PromotionError(f"no such channel: {', '.join(unknown)}")
+        required = required_checks(governing, names)
+        failed = checks.missing(required, request["results"])
+        if failed:
+            raise PromotionError(f"checks not passed: {', '.join(failed)}")
+        for name in names:
+            pin_text(governing["channels"][name], request["pins"][name])
         if not _on_branch(repo, build, ref):
-            raise PromotionError(f"the build's commit {build} is not on {config['branch']}")
-        planned = edits(repo, config, request, ref)
+            raise PromotionError(f"the build's commit {build} is not on {config['branch']}{_shallow_hint(repo)}")
+        planned = edits(repo, governing, request, ref)
         changes = [edit for edit in planned if edit["current"] != edit["updated"]]
         moved = [edit["channel"] for edit in changes]
         kept = [edit["channel"] for edit in planned if edit["current"] == edit["updated"]]
-        tip = git(repo, "rev-parse", ref)
+        dry = bool(request.get("dry_run"))
         if not changes:
-            return {
-                "commit": tip,
-                "promoted": [],
-                "unchanged": kept,
-                "attempts": attempt,
-                "dry_run": bool(request.get("dry_run")),
-            }
+            return {"commit": tip, "promoted": [], "unchanged": kept, "attempts": attempt, "dry_run": dry}
         for name in moved:
-            changed = stale(repo, build, ref, sources(config, config["channels"][name]))
+            what, changed = stale_files(repo, governing, governing["channels"][name], build, ref)
             if changed:
                 raise PromotionError(
-                    f"{name}: the build is older than its sources or pin on {config['branch']}: {', '.join(changed)}"
+                    f"{name}: the build is older than {what} on {config['branch']}: {', '.join(changed)}"
                 )
-        if request.get("dry_run"):
+        if dry:
             return {"commit": tip, "promoted": moved, "unchanged": kept, "attempts": attempt, "dry_run": True}
-        journal = journal_entry(config, request, moved, required, day) if config["journal"] else ""
+        journal = journal_entry(governing, request, moved, required, day) if governing["journal"] else ""
         moved_request = cast(Request, {**request, "pins": {name: request["pins"][name] for name in moved}})
-        text = message(config, moved_request, moved, required)
-        pushed, commit = _commit_and_push(repo, config, ref, changes, journal, text, request.get("author"))
-        if pushed:
-            return {"commit": commit, "promoted": moved, "unchanged": kept, "attempts": attempt, "dry_run": False}
-        notes.append(f"the push was refused (attempt {attempt} of {config['attempts']}); trying again from the new tip")
-    raise PromotionError(f"the push was refused {config['attempts']} times; nothing was promoted")
+        text = message(governing, moved_request, moved, required)
+        pushed = _commit_and_push(repo, governing, ref, changes, journal, text, request.get("author"))
+        if pushed["ok"]:
+            return {
+                "commit": pushed["commit"],
+                "promoted": moved,
+                "unchanged": kept,
+                "attempts": attempt,
+                "dry_run": False,
+            }
+        fetch(repo, config)
+        if git(repo, "rev-parse", ref) == tip:
+            raise PromotionError(
+                f"the push to {config['branch']} was refused and the branch did not move,"
+                f" so trying again would change nothing: {pushed['error'] or 'git gave no reason'}"
+            )
+        notes.append(f"the push was refused (attempt {attempt} of {attempts}); {config['branch']} moved, trying again")
+        if attempt < attempts:
+            sleep(_pause(attempt))
+    raise PromotionError(f"the push was refused {attempts} times; nothing was promoted")
+
+
+def pin_at(repo: Path, ref: str, channel: Channel) -> dict[str, object] | None:
+    """One channel's pin as `ref` holds it (None when the file does not exist there)."""
+    text = _show(repo, ref, channel["pin"])
+    if not text:
+        return None
+    parsed: object = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise PromotionError(f"{channel['pin']} at {ref} is not a JSON object")
+    return cast(dict[str, object], parsed)
 
 
 def current(repo: Path, config: Config, ref: str) -> dict[str, dict[str, object] | None]:
     """Every channel's pin as `ref` holds it (None when the file does not exist there)."""
-    out: dict[str, dict[str, object] | None] = {}
-    for name, channel in config["channels"].items():
-        text = _show(repo, ref, channel["pin"])
-        out[name] = cast(dict[str, object], json.loads(text)) if text else None
-    return out
+    return {name: pin_at(repo, ref, channel) for name, channel in config["channels"].items()}

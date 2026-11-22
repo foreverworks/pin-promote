@@ -21,6 +21,7 @@ Parsing is pure: `parse` takes the decoded JSON and returns a checked `Config`, 
 `ConfigError` naming every problem it found.
 """
 
+import fnmatch
 import json
 import re
 from pathlib import Path, PurePosixPath
@@ -30,11 +31,14 @@ SCHEMA = 1
 NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")  # no ".": --pin CHANNEL.FIELD=VALUE splits there
 FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
-REGISTRY_IMAGE = re.compile(r"[a-z0-9.-]+(?::[0-9]+)?(?:/[a-z0-9._-]+)+")
+REGISTRY_IMAGE = re.compile(r"(?:[a-z0-9.-]+|\[::1\])(?::[0-9]+)?(?:/[a-z0-9._-]+)+")
+HOSTNAME = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]+)?")
 REGISTRY_TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
 TOP_LEVEL = {"schema", "branch", "remote", "attempts", "shared_sources", "journal", "channels"}
 CHANNEL_KEYS = {"pin", "fields", "sources", "checks", "subject", "note", "registry"}
-REGISTRY_KEYS = {"image", "tag", "field"}
+REGISTRY_KEYS = {"image", "tag", "field", "token_host"}
+GLOB = "*?["
+EXCLUDE = (":!", ":^")
 
 
 class Registry(TypedDict):
@@ -43,13 +47,14 @@ class Registry(TypedDict):
     image: str  # e.g. registry.example.com/team/base, without a tag or digest
     tag: str
     field: str  # the pin field holding the digest (sha256:<64 hex>)
+    token_host: NotRequired[str]  # the one host, other than the registry's, a bearer token may be fetched from
 
 
 class Channel(TypedDict):
     name: str
     pin: str  # repository-relative path of the pin file
     fields: dict[str, str]  # field name -> the pattern its value must fully match; the file's key order
-    sources: list[str]  # git pathspecs a build must not be older than; the pin and shared sources join them
+    sources: list[str]  # git pathspecs a build must not be older than; ':!' exclusions apply inside this list only
     checks: list[str]  # every one must have passed for this channel's pin to move
     subject: str  # the commit subject when this channel moves
     note: str  # appended to the channel's journal line; may be empty
@@ -65,30 +70,65 @@ class Config(TypedDict):
     channels: dict[str, Channel]
 
 
+class SourceClasses(TypedDict):
+    """What a build of one channel must not be older than, in the three classes git is asked about."""
+
+    own: list[str]  # the channel's sources: pathspecs, with ':!' exclusions that apply to this list only
+    shared: list[str]  # the config's shared sources: pathspecs, no exclusions
+    pin: str  # the channel's own pin file, always a literal path
+
+
 class ConfigError(ValueError):
     """The config is not one this version can promote with; the message lists every problem."""
 
 
-def _relative_path(value: object) -> bool:
+def is_relative_path(value: object) -> bool:
     if not isinstance(value, str) or not value or "\\" in value or "\0" in value:
         return False
     path = PurePosixPath(value)
     return not path.is_absolute() and ".." not in path.parts and str(path) == value.rstrip("/")
 
 
+def _file_path(value: object) -> bool:
+    """A repository-relative path git may track: no '.git' component, which git never stores."""
+    return is_relative_path(value) and all(part.casefold() != ".git" for part in PurePosixPath(str(value)).parts)
+
+
+def _plain(spec: str) -> str:
+    return (spec[2:] if spec.startswith(EXCLUDE) else spec).rstrip("/")
+
+
 def _pathspec(value: object) -> bool:
     if not isinstance(value, str) or not value or "\0" in value or "\n" in value:
         return False
-    plain = value[2:] if value.startswith((":!", ":^")) else value
+    plain = value[2:] if value.startswith(EXCLUDE) else value
     # Magic other than exclusion (":(glob)", ":(top)") is left out: it changes what a path means.
-    return not plain.startswith(":") and _relative_path(plain.rstrip("/") or ".")
+    if plain.startswith(":") or not is_relative_path(plain.rstrip("/") or "."):
+        return False
+    # A pathspec that selects the whole repository (or nothing but wildcards) makes every build stale.
+    return plain.rstrip("/") not in ("", ".") and plain.strip("*") != ""
+
+
+def _matches(path: str, spec: str) -> bool:
+    """Whether `path` is inside the file or directory `spec` selects (globs as git pathspec globs)."""
+    plain = _plain(spec)
+    if any(char in plain for char in GLOB):
+        parts = PurePosixPath(path).parts
+        return any(fnmatch.fnmatchcase("/".join(parts[:i]), plain) for i in range(1, len(parts) + 1))
+    return path == plain or path.startswith(plain + "/")
+
+
+def _selected(path: str, specs: list[str]) -> bool:
+    included = [spec for spec in specs if not spec.startswith(EXCLUDE)]
+    excluded = [spec for spec in specs if spec.startswith(EXCLUDE)]
+    return any(_matches(path, spec) for spec in included) and not any(_matches(path, spec) for spec in excluded)
 
 
 def _strings(value: object) -> bool:
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
 
 
-def _channel(name: str, raw: object, problems: list[str]) -> Channel | None:
+def _channel(name: str, raw: object, problems: list[str], config_path: str | None) -> Channel | None:
     where = f"channels.{name}"
     if not NAME.fullmatch(name):
         problems.append(f"{where}: a channel name is lower case letters, digits, '_' and '-'")
@@ -99,8 +139,10 @@ def _channel(name: str, raw: object, problems: list[str]) -> Channel | None:
     for key in sorted(set(data) - CHANNEL_KEYS):
         problems.append(f"{where}.{key}: unknown key")
     pin = data.get("pin")
-    if not _relative_path(pin) or not str(pin).endswith(".json"):
-        problems.append(f"{where}.pin: a repository-relative path to a .json file, without '..'")
+    if not _file_path(pin) or not str(pin).endswith(".json"):
+        problems.append(f"{where}.pin: a repository-relative path to a .json file, without '..' or a '.git' part")
+    elif pin == config_path:
+        problems.append(f"{where}.pin: this is the config file itself")
     fields = data.get("fields")
     patterns: dict[str, str] = {}
     if not isinstance(fields, dict) or not fields:
@@ -124,10 +166,13 @@ def _channel(name: str, raw: object, problems: list[str]) -> Channel | None:
             patterns[field] = pattern
     sources = data.get("sources", [])
     if not _strings(sources) or not all(_pathspec(item) for item in cast(list[str], sources)):
-        problems.append(f"{where}.sources: a list of repository-relative git pathspecs (':!' excludes one)")
+        problems.append(
+            f"{where}.sources: a list of repository-relative git pathspecs (':!' excludes one);"
+            " not '.' or anything else that selects the whole repository"
+        )
         sources = []
     sources = cast(list[str], sources)
-    if sources and all(item.startswith((":!", ":^")) for item in sources):
+    if sources and all(item.startswith(EXCLUDE) for item in sources):
         problems.append(f"{where}.sources: exclusions alone select nothing")
     checks = data.get("checks")
     if not _strings(checks) or not checks or not all(cast(list[str], checks)):
@@ -162,10 +207,19 @@ def _channel(name: str, raw: object, problems: list[str]) -> Channel | None:
             for key in sorted(set(reg) - REGISTRY_KEYS):
                 problems.append(f"{where}.registry.{key}: unknown key")
             image, tag, target = reg.get("image"), reg.get("tag"), reg.get("field")
-            if not isinstance(image, str) or not REGISTRY_IMAGE.fullmatch(image):
+            if (
+                not isinstance(image, str)
+                or not REGISTRY_IMAGE.fullmatch(image)
+                or any(part in (".", "..") for part in image.split("/"))
+            ):
                 problems.append(
-                    f"{where}.registry.image: a registry host and repository, e.g. registry.example.com/team/app"
+                    f"{where}.registry.image: a registry host and repository, e.g. registry.example.com/team/app,"
+                    " without '.' or '..' as a path part"
                 )
+            token_host = reg.get("token_host")
+            if "token_host" in reg and (not isinstance(token_host, str) or not HOSTNAME.fullmatch(token_host)):
+                problems.append(f"{where}.registry.token_host: a host name (lower case, optional :port)")
+                token_host = None
             if not isinstance(tag, str) or not REGISTRY_TAG.fullmatch(tag):
                 problems.append(f"{where}.registry.tag: a tag name")
             if not isinstance(target, str) or target not in patterns:
@@ -174,11 +228,15 @@ def _channel(name: str, raw: object, problems: list[str]) -> Channel | None:
                 problems.append(f"{where}.registry.field: the field's pattern must accept only sha256:<64 hex> digests")
             if isinstance(image, str) and isinstance(tag, str) and isinstance(target, str):
                 channel["registry"] = {"image": image, "tag": tag, "field": target}
+                if isinstance(token_host, str):
+                    channel["registry"]["token_host"] = token_host
     return channel
 
 
-def parse(raw: object) -> Config:
-    """A checked config from decoded JSON; ConfigError lists every problem at once."""
+def parse(raw: object, config_path: str | None = None) -> Config:
+    """A checked config from decoded JSON; ConfigError lists every problem at once.
+
+    `config_path` is the config file's repository-relative path: no pin or journal may be that file."""
     problems: list[str] = []
     if not isinstance(raw, dict):
         raise ConfigError("the config must be a JSON object")
@@ -188,24 +246,31 @@ def parse(raw: object) -> Config:
     for key in sorted(set(data) - TOP_LEVEL):
         problems.append(f"{key}: unknown key")
     branch = data.get("branch", "main")
-    if not isinstance(branch, str) or not re.fullmatch(r"[A-Za-z0-9._/-]+", branch) or ".." in branch:
-        problems.append("branch: a branch name")
+    if not isinstance(branch, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch) or ".." in branch:
+        problems.append("branch: a branch name, starting with a letter or a digit")
         branch = "main"
     remote = data.get("remote", "origin")
-    if not isinstance(remote, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", remote):
-        problems.append("remote: a remote name")
+    if not isinstance(remote, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", remote):
+        problems.append("remote: a remote name, starting with a letter or a digit")
         remote = "origin"
     attempts = data.get("attempts", 3)
     if not isinstance(attempts, int) or isinstance(attempts, bool) or not 1 <= attempts <= 20:
         problems.append("attempts: a whole number from 1 to 20")
         attempts = 3
     shared = data.get("shared_sources", [])
-    if not _strings(shared) or not all(_pathspec(item) for item in cast(list[str], shared)):
-        problems.append("shared_sources: a list of repository-relative git pathspecs")
+    if (
+        not _strings(shared)
+        or not all(_pathspec(item) for item in cast(list[str], shared))
+        or any(item.startswith(EXCLUDE) for item in cast(list[str], shared))
+    ):
+        problems.append(
+            "shared_sources: a list of repository-relative git pathspecs, without ':!' exclusions"
+            " and without one that selects the whole repository"
+        )
         shared = []
     journal = data.get("journal", [])
-    if not _strings(journal) or not all(_relative_path(item) for item in cast(list[str], journal)):
-        problems.append("journal: a list of repository-relative file paths")
+    if not _strings(journal) or not all(_file_path(item) for item in cast(list[str], journal)):
+        problems.append("journal: a list of repository-relative file paths, without a '.git' part")
         journal = []
     raw_channels = data.get("channels")
     channels: dict[str, Channel] = {}
@@ -213,7 +278,7 @@ def parse(raw: object) -> Config:
         problems.append("channels: an object with at least one channel")
     else:
         for name, body in cast(dict[str, object], raw_channels).items():
-            channel = _channel(name, body, problems)
+            channel = _channel(name, body, problems, config_path)
             if channel is not None:
                 channels[name] = channel
         pins = [c["pin"] for c in channels.values()]
@@ -221,6 +286,17 @@ def parse(raw: object) -> Config:
             problems.append(f"channels: two channels write {pin}")
         for pin in sorted(set(pins) & set(cast(list[str], journal))):
             problems.append(f"journal: {pin} is a channel's pin file")
+        for path in cast(list[str], journal):
+            if path == config_path:
+                problems.append(f"journal: {path} is the config file itself")
+            if _selected(path, cast(list[str], shared)):
+                problems.append(f"journal: {path} is inside shared_sources, so every promotion would make builds stale")
+            for channel in channels.values():
+                if _selected(path, channel["sources"]):
+                    problems.append(
+                        f"journal: {path} is inside the sources of channel {channel['name']}, so a promotion would"
+                        " make its builds stale"
+                    )
     if problems:
         raise ConfigError("\n".join(problems))
     return {
@@ -233,18 +309,18 @@ def parse(raw: object) -> Config:
     }
 
 
-def load(path: Path) -> Config:
+def load(path: Path, relative: str | None = None) -> Config:
+    """The config file at `path`; `relative` is its path inside the repository (default: the file's name)."""
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ConfigError(f"{path}: {error}") from error
     try:
-        return parse(raw)
+        return parse(raw, path.name if relative is None else relative)
     except ConfigError as error:
         raise ConfigError("\n".join(f"{path}: {line}" for line in str(error).splitlines())) from error
 
 
-def sources(config: Config, channel: Channel) -> list[str]:
+def source_classes(config: Config, channel: Channel) -> SourceClasses:
     """What a build of this channel must not be older than: its sources, the shared ones, its pin."""
-    out = [*channel["sources"], *config["shared_sources"], channel["pin"]]
-    return list(dict.fromkeys(out))
+    return {"own": channel["sources"], "shared": config["shared_sources"], "pin": channel["pin"]}

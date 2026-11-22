@@ -5,19 +5,25 @@
     pin-promote promote [--config FILE] --build SHA --pin CHANNEL.FIELD=VALUE ...
                         [--passed CHECK ...] [--needs-json JSON | --needs-file FILE]
                         [--run-url URL] [--author "Name <email>"] [--dry-run] [--json]
-    pin-promote tag     [--config FILE] --channel NAME [--ref REF] [--plain-http]
+    pin-promote tag     [--config FILE] --channel NAME [--plain-http]
+
+`check` reads the local config file; `promote` and `tag` read the config at the branch's tip.
 
 Exit status: 0 done (or nothing to do), 1 refused or failed, 2 a usage error.
 """
 
 import argparse
+import contextlib
 import json
+import signal
 import sys
-from pathlib import Path
+from collections.abc import Iterator
+from pathlib import Path, PurePosixPath
+from types import FrameType
 
-from . import __version__, checks, registry
-from .config import Config, ConfigError, load
-from .promote import GitError, PromotionError, Request, current, git, promote
+from . import __version__, checks, registry, tags
+from .config import ConfigError, is_relative_path, load
+from .promote import GitError, PromotionError, Request, current, promote
 
 DEFAULT_CONFIG = "pin-promote.json"
 
@@ -35,29 +41,30 @@ def _pins(values: list[str], parser: argparse.ArgumentParser) -> dict[str, dict[
     return out
 
 
-def _tags(config: Config, repo: Path, names: list[str], ref: str, plain_http: bool, lines: list[str]) -> list[str]:
-    """Move each named channel's registry tag to the digest its pin holds at `ref`."""
-    moved: list[str] = []
-    pins = current(repo, config, ref)
-    for name in names:
-        channel = config["channels"][name]
-        if "registry" not in channel:
-            continue
-        target = channel["registry"]
-        pin = pins.get(name)
-        digest = pin.get(target["field"]) if pin else None
-        if not isinstance(digest, str):
-            raise registry.RegistryError(f"{name}: {channel['pin']} at {ref} holds no {target['field']}")
-        image = f"{target['image']}:{target['tag']}"
-        if registry.move_tag(target["image"], target["tag"], digest, plain_http=plain_http):
-            moved.append(name)
-            lines.append(f"{name}: moved {image} to {digest}")
-        else:
-            lines.append(f"{name}: {image} already at {digest}")
-    return moved
+def _terminate(signum: int, frame: FrameType | None) -> None:
+    raise SystemExit(128 + signum)  # unwinds the stack, so the temporary worktree is removed
+
+
+@contextlib.contextmanager
+def exits_on_sigterm() -> Iterator[None]:
+    """SIGTERM (a CI job cancelled) ends the run through SystemExit instead of killing it mid-push."""
+    try:
+        previous = signal.signal(signal.SIGTERM, _terminate)
+    except ValueError:  # not the main thread: nothing to install
+        yield
+        return
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def main(argv: list[str] | None = None) -> int:
+    with exits_on_sigterm():
+        return _main(argv)
+
+
+def _main(argv: list[str] | None) -> int:
     parser = argparse.ArgumentParser(prog="pin-promote", description="Move pins only after their checks pass.")
     parser.add_argument("--version", action="version", version=f"pin-promote {__version__}")
     parser.add_argument("-C", dest="repo", default=".", help="the repository (default: the current directory)")
@@ -83,17 +90,22 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--run-url", default="", help="a link to the build, for the commit and the journal")
     run.add_argument("--author", default="", help="'Name <email>' for the commit (default: git's own)")
     run.add_argument("--dry-run", action="store_true", help="check everything, commit nothing")
-    run.add_argument("--plain-http", action="store_true", help="talk to the registry over http (a local test registry)")
+    run.add_argument(
+        "--plain-http", action="store_true", help="talk to the registry over http (only for a registry on localhost)"
+    )
     run.add_argument("--json", action="store_true", help="print the result as JSON")
-    tag = with_config("tag", "move a channel's registry tag to the digest its pin holds (a retry)")
+    tag = with_config("tag", "move a channel's registry tag to the digest its pin holds at the branch's tip (a retry)")
     tag.add_argument("--channel", required=True)
-    tag.add_argument("--ref", default="")
     tag.add_argument("--plain-http", action="store_true")
     args = parser.parse_args(argv)
 
     repo = Path(args.repo)
+    relative = PurePosixPath(args.config).as_posix()
+    if not is_relative_path(relative):
+        print(f"failed: --config must be a path inside the repository: {args.config!r}", file=sys.stderr)
+        return 1
     try:
-        config = load(repo / args.config)
+        config = load(repo / relative, relative)
     except ConfigError as error:
         print(error, file=sys.stderr)
         return 1
@@ -109,10 +121,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "tag":
             if args.channel not in config["channels"] or "registry" not in config["channels"][args.channel]:
                 parser.error(f"--channel: {args.channel} has no registry tag")
-            git(repo, "fetch", "--quiet", config["remote"], f"+refs/heads/{config['branch']}:{branch_ref}")
-            lines: list[str] = []
-            _tags(config, repo, [args.channel], args.ref or branch_ref, args.plain_http, lines)
-            print("\n".join(lines))
+            tags.follow(
+                repo,
+                config,
+                relative,
+                [args.channel],
+                None,
+                plain_http=args.plain_http,
+                explicit=True,
+                moved=[],
+                say=print,
+            )
             return 0
         needs: dict[str, str] = {}
         if args.needs_json or args.needs_file:
@@ -128,35 +147,51 @@ def main(argv: list[str] | None = None) -> int:
         if args.author:
             request["author"] = args.author
         log: list[str] = []
-        result = promote(repo, config, request, log=log)
+        result = promote(repo, config, relative, request, log=log)
         for line in log:
             print(line, file=sys.stderr)
-        tags: list[str] = []
+        moved: list[str] = []
+        tag_error = ""
         if not result["dry_run"]:
-            # After the pin is on the branch, and on a retry that changed nothing: the tag follows the pin.
+            # After the pin is on the branch, and on a retry that changed nothing: the tag follows the pin
+            # as the branch's tip holds it now.
             try:
-                tags = _tags(config, repo, list(request["pins"]), result["commit"], args.plain_http, log := [])
-            except registry.RegistryError as error:
-                print(
-                    f"failed: the pins are on {config['branch']} in {result['commit']}, but a registry tag did not"
-                    f" move: {error}. Run this promotion again, or `pin-promote tag --channel <name>`.",
-                    file=sys.stderr,
+                tags.follow(
+                    repo,
+                    config,
+                    relative,
+                    list(request["pins"]),
+                    request["pins"],
+                    plain_http=args.plain_http,
+                    explicit=False,
+                    moved=moved,
+                    say=lambda line: print(line, file=sys.stderr),
                 )
-                return 1
-            for line in log:
-                print(line, file=sys.stderr)
+            except (registry.RegistryError, PromotionError, GitError) as error:
+                tag_error = str(error)
         if args.json:
-            print(json.dumps({**result, "tags_moved": tags}, sort_keys=True))
+            print(
+                json.dumps(
+                    {**result, "tags_moved": moved, **({"tag_error": tag_error} if tag_error else {})}, sort_keys=True
+                )
+            )
         else:
             verb = "would promote" if result["dry_run"] else "promoted"
             if result["promoted"]:
                 print(f"{verb} {', '.join(result['promoted'])} in {result['commit']}")
             if result["unchanged"]:
                 print(f"unchanged: {', '.join(result['unchanged'])} (at {result['commit']})")
+        if tag_error:
+            print(
+                f"failed: the pins are on {config['branch']} in {result['commit']}, but a registry tag did not"
+                f" move: {tag_error}. Run this promotion again, or `pin-promote tag --channel <name>`.",
+                file=sys.stderr,
+            )
+            return 1
         return 0
     except (PromotionError, checks.EvidenceError) as error:
         print(f"refused: {error}", file=sys.stderr)
         return 1
-    except (GitError, registry.RegistryError, OSError) as error:
+    except (GitError, registry.RegistryError, OSError, ValueError) as error:
         print(f"failed: {error}", file=sys.stderr)
         return 1
