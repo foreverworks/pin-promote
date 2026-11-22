@@ -7,7 +7,7 @@ import urllib.parse
 from unittest import mock
 
 from pin_promote import registry
-from pin_promote.registry import RegistryError, move_tag
+from pin_promote.registry import RegistryError, SupersededError, move_tag
 
 from .support import (
     DOCKER_LIST,
@@ -74,6 +74,17 @@ class MoveTests(RegistryTestCase):
         self.assertEqual(put["body"], body)
         self.assertEqual(put["content_type"], OCI_MANIFEST)
         self.assertEqual(self.state["manifests"][(REPO, TAG)], (body, OCI_MANIFEST))
+
+    def test_the_pin_is_asked_again_just_before_the_put(self) -> None:
+        digest = self.add(manifest(OCI_MANIFEST), OCI_MANIFEST)
+        with self.assertRaises(SupersededError):
+            move_tag(self.image, TAG, digest, plain_http=True, current=lambda: False)
+        self.assertEqual(self.puts(), [])
+        self.assertNotIn((REPO, TAG), self.state["manifests"])
+        self.assertTrue(move_tag(self.image, TAG, digest, plain_http=True, current=lambda: True))
+        self.assertEqual(len(self.puts()), 1)
+        # A tag already on the digest needs no PUT, so nothing to ask.
+        self.assertFalse(move_tag(self.image, TAG, digest, plain_http=True, current=lambda: False))
 
     def test_a_tag_already_on_the_digest_is_left_alone(self) -> None:
         digest = self.add(manifest(OCI_MANIFEST), OCI_MANIFEST)

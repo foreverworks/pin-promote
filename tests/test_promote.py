@@ -3,9 +3,11 @@
 import copy
 import json
 import subprocess
+import sys
 from pathlib import Path
+from unittest import mock
 
-from pin_promote import GitError, PromotionError, Request, current, parse, promote
+from pin_promote import Channel, GitError, PromotionError, Request, current, parse, promote
 from pin_promote.promote import journal_entry, pin_text
 
 from .support import CONFIG, CONFIG_PATH, FP_A, FP_B, FP_C, Repository, run_git
@@ -241,6 +243,46 @@ class Retry(Repository):
             )
         self.assertEqual(pauses, [1.0, 2.0, 4.0])  # none after the last attempt
 
+    def test_the_last_refusal_keeps_gits_message_and_the_retry_note_only_precedes_a_retry(self) -> None:
+        self.hook(10, empty=True)
+        log: list[str] = []
+        with self.assertRaises(PromotionError) as caught:
+            promote(
+                self.clone,
+                self.config,
+                CONFIG_PATH,
+                request(self.build, {"vm": {"fingerprint": FP_B}}),
+                log=log,
+                sleep=lambda _: None,
+            )
+        self.assertIn("refused 3 times", str(caught.exception))
+        self.assertIn("the remote says no", str(caught.exception))
+        self.assertEqual(len(log), 2)  # attempts 1 and 2 are retried; attempt 3 is the last
+        self.assertIn("attempt 2 of 3", log[1])
+
+    def test_a_failing_second_fetch_does_not_replace_the_push_error(self) -> None:
+        self.hook(10)
+        module = sys.modules["pin_promote.promote"]  # the package's `promote` is the function
+        real = module.fetch
+        calls: list[int] = []
+
+        def fetch(*args: object, **kwargs: object) -> str:
+            calls.append(1)
+            if len(calls) == 2:
+                raise GitError("fetch: the network is gone")
+            return str(real(*args, **kwargs))
+
+        with mock.patch.object(module, "fetch", fetch), self.assertRaises(GitError) as caught:
+            promote(
+                self.clone,
+                self.config,
+                CONFIG_PATH,
+                request(self.build, {"vm": {"fingerprint": FP_B}}),
+                sleep=lambda _: None,
+            )
+        self.assertIn("the remote says no", str(caught.exception))
+        self.assertIn("the network is gone", str(caught.exception))
+
     def test_the_branch_moving_to_a_newer_source_between_attempts_refuses(self) -> None:
         # A concurrent push lands a newer image source while the first push is refused.
         run_git(self.clone, "checkout", "-q", "--detach", "origin/main")
@@ -291,6 +333,20 @@ class Retry(Repository):
 
 
 class Pure(Repository):
+    def test_a_registry_field_only_takes_a_full_digest(self) -> None:
+        registry = {"image": "registry.example.com/team/app", "tag": "stable", "field": "digest"}
+        raw = copy.deepcopy(CONFIG)
+        raw["channels"]["vm"] = {  # type: ignore[index]
+            **CONFIG["channels"]["vm"],  # type: ignore[index]
+            "fields": {"digest": "sha256:[0-9a-f]{64}"},
+            "registry": registry,
+        }
+        channel = parse(raw)["channels"]["vm"]
+        pin_text(channel, {"digest": "sha256:" + "1" * 64})
+        loose: Channel = {**channel, "fields": {"digest": "sha256:[0-9a-f]+"}}  # what an older config could have held
+        with self.assertRaisesRegex(PromotionError, "not a sha256:<64 hex> digest"):
+            pin_text(loose, {"digest": "sha256:abcd"})
+
     def test_pin_text_keeps_the_config_order(self) -> None:
         host = self.config["channels"]["host"]
         self.assertEqual(

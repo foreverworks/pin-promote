@@ -21,6 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from email.message import Message
 from http.client import HTTPResponse
 
@@ -42,6 +43,10 @@ CHALLENGE = re.compile(r'(\w+)="([^"]*)"')
 
 class RegistryError(RuntimeError):
     """The registry refused or answered something unusable; the tag may not have moved."""
+
+
+class SupersededError(RegistryError):
+    """The pin no longer holds this digest, so the tag was left alone (see `move_tag`'s `current`)."""
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -175,11 +180,22 @@ def _declared_media(body: bytes) -> str | None:
     return declared if isinstance(declared, str) else None
 
 
-def move_tag(image: str, tag: str, digest: str, *, plain_http: bool = False, token_host: str | None = None) -> bool:
+def move_tag(
+    image: str,
+    tag: str,
+    digest: str,
+    *,
+    plain_http: bool = False,
+    token_host: str | None = None,
+    current: Callable[[], bool] | None = None,
+) -> bool:
     """Point `image:tag` at `digest`; True when it moved, False when it was already there.
 
     `plain_http` is for a registry on this machine; `token_host` names the one other host a bearer
-    token may be fetched from (default: the registry's own)."""
+    token may be fetched from (default: the registry's own). `current`, when given, is asked just
+    before the PUT whether the pin still holds `digest`; if not, SupersededError is raised and the tag is
+    untouched. The registry has no compare-and-swap, so this only narrows the window in which a newer
+    promotion's tag move can be overwritten (README, "Registry tags")."""
     deadline = time.monotonic() + DEADLINE
     if not DIGEST.fullmatch(digest):
         raise RegistryError(f"not a sha256 digest: {digest!r}")
@@ -208,6 +224,8 @@ def move_tag(image: str, tag: str, digest: str, *, plain_http: bool = False, tok
     status, headers, _ = _request("HEAD", base + tag, *call, headers=accept)
     if status == 200 and headers.get("Docker-Content-Digest") == digest:
         return False
+    if current is not None and not current():
+        raise SupersededError(f"{image}:{tag}: the pin no longer holds {digest}")
     status, headers, _ = _request("PUT", base + tag, *call, data=body, headers={"Content-Type": media})
     if status not in (200, 201):
         raise RegistryError(f"PUT {image}:{tag}: HTTP {status}")

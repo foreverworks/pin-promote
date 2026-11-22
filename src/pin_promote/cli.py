@@ -7,7 +7,8 @@
                         [--run-url URL] [--author "Name <email>"] [--dry-run] [--json]
     pin-promote tag     [--config FILE] --channel NAME [--plain-http]
 
-`check` reads the local config file; `promote` and `tag` read the config at the branch's tip.
+`check` and `show` read the local config file; `promote` and `tag` read only its `remote`, `branch` and
+`attempts`, and take everything else from the config at the branch's tip.
 
 Exit status: 0 done (or nothing to do), 1 refused or failed, 2 a usage error.
 """
@@ -22,7 +23,7 @@ from pathlib import Path, PurePosixPath
 from types import FrameType
 
 from . import __version__, checks, registry, tags
-from .config import ConfigError, is_relative_path, load
+from .config import ConfigError, is_relative_path, load, load_local
 from .promote import GitError, PromotionError, Request, current, promote
 
 DEFAULT_CONFIG = "pin-promote.json"
@@ -105,22 +106,17 @@ def _main(argv: list[str] | None) -> int:
         print(f"failed: --config must be a path inside the repository: {args.config!r}", file=sys.stderr)
         return 1
     try:
-        config = load(repo / relative, relative)
-    except ConfigError as error:
-        print(error, file=sys.stderr)
-        return 1
-    branch_ref = f"refs/remotes/{config['remote']}/{config['branch']}"
-    try:
         if args.command == "check":
-            for name, channel in config["channels"].items():
+            for name, channel in load(repo / relative, relative)["channels"].items():
                 print(f"{name}: {channel['pin']} after {', '.join(channel['checks'])}")
             return 0
         if args.command == "show":
-            print(json.dumps(current(repo, config, args.ref or branch_ref), indent=2, sort_keys=True))
+            full = load(repo / relative, relative)
+            branch_ref = f"refs/remotes/{full['remote']}/{full['branch']}"
+            print(json.dumps(current(repo, full, args.ref or branch_ref), indent=2, sort_keys=True))
             return 0
+        config = load_local(repo / relative)  # promote and tag: the tip's config governs the rest
         if args.command == "tag":
-            if args.channel not in config["channels"] or "registry" not in config["channels"][args.channel]:
-                parser.error(f"--channel: {args.channel} has no registry tag")
             tags.follow(
                 repo,
                 config,
@@ -189,6 +185,9 @@ def _main(argv: list[str] | None) -> int:
             )
             return 1
         return 0
+    except ConfigError as error:
+        print(error, file=sys.stderr)
+        return 1
     except (PromotionError, checks.EvidenceError) as error:
         print(f"refused: {error}", file=sys.stderr)
         return 1

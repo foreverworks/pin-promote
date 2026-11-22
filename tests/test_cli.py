@@ -114,6 +114,19 @@ class Cli(CliCase):
         self.assertEqual(code, 1)
         self.assertIn("checks not passed: lint (not run)", err)
 
+    def test_promote_needs_only_the_remote_branch_and_attempts_from_the_local_file(self) -> None:
+        (self.clone / CONFIG_PATH).write_text(json.dumps({"schema": 99, "channels": "from an older version"}))
+        code, _, err = self.run_cli("check")
+        self.assertEqual(code, 1)  # check and show read the whole local file
+        code, out, err = self.run_cli(
+            "promote", "--build", self.build, "--pin", f"vm.fingerprint={FP_B}", "--passed", "boot"
+        )
+        self.assertEqual((code, out), (0, f"promoted vm in {self.tip()}\n"), err)
+        (self.clone / CONFIG_PATH).write_text(json.dumps({"branch": "-d"}))
+        code, _, err = self.run_cli("promote", "--build", self.build, "--pin", f"vm.fingerprint={FP_B}")
+        self.assertEqual(code, 1)
+        self.assertIn("branch", err)
+
     def test_the_config_may_be_in_a_subdirectory_but_not_outside_the_repository(self) -> None:
         self.set_config(copy.deepcopy(CONFIG), "ci/pins.json")
         code, _, err = self.run_cli(
@@ -252,12 +265,32 @@ class Tags(CliCase):
         code, _, err = self.run_cli("tag", "--channel", "app", "--plain-http")
         self.assertEqual((code, self.tagged()), (0, self.second), err)
 
+    def test_the_tag_command_checks_the_channel_against_the_tip_not_the_local_file(self) -> None:
+        self.commit({"deploy/app.json": json.dumps({"digest": self.second}) + "\n"}, "pinned")
+        (self.clone / CONFIG_PATH).write_text(json.dumps(CONFIG))  # an older local file: no "app" channel at all
+        code, _, err = self.run_cli("tag", "--channel", "app", "--plain-http")
+        self.assertEqual((code, self.tagged()), (0, self.second), err)
+
+    def test_a_newer_promotion_between_the_read_and_the_put_keeps_the_tag_where_it_is(self) -> None:
+        self.commit({"deploy/app.json": json.dumps({"digest": self.first}) + "\n"}, "pinned")
+        real = sys.modules["pin_promote.tags"].move_tag
+
+        def then_the_pin_moves(*args: object, **kwargs: object) -> bool:
+            self.commit({"deploy/app.json": json.dumps({"digest": self.second}) + "\n"}, "a newer promotion")
+            return real(*args, **kwargs)  # type: ignore[no-any-return]
+
+        with mock.patch.object(sys.modules["pin_promote.tags"], "move_tag", then_the_pin_moves):
+            code, _, err = self.run_cli("tag", "--channel", "app", "--plain-http")
+        self.assertEqual(code, 0, err)
+        self.assertIn("a newer promotion holds the pin", err + _)
+        self.assertEqual([seen for seen in self.state["seen"] if seen["method"] == "PUT"], [])
+
     def test_the_tag_command_has_no_ref_option(self) -> None:
         code, _, err = self.run_cli("tag", "--channel", "app", "--ref", "HEAD")
         self.assertEqual(code, 2)
         self.assertIn("--ref", err)
         code, _, err = self.run_cli("tag", "--channel", "vm")
-        self.assertEqual((code, "has no registry tag" in err), (2, True))
+        self.assertEqual((code, "no registry tag is configured at the tip of main" in err), (1, True))
 
     def test_a_channel_whose_pin_does_not_exist_yet_fails_the_tag_command(self) -> None:
         code, _, err = self.run_cli("tag", "--channel", "app", "--plain-http")

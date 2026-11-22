@@ -13,9 +13,22 @@ Python standard library only.
 __version__ = "0.1.0"
 
 from .checks import EvidenceError, evidence, from_needs, missing
-from .config import SCHEMA, Channel, Config, ConfigError, Registry, SourceClasses, load, parse, source_classes
+from .config import (
+    SCHEMA,
+    Channel,
+    Config,
+    ConfigError,
+    Local,
+    Registry,
+    SourceClasses,
+    load,
+    load_local,
+    parse,
+    parse_local,
+    source_classes,
+)
 from .promote import Edit, GitError, PromotionError, Request, Result, current, pin_text, promote, tip_config
-from .registry import RegistryError, move_tag
+from .registry import RegistryError, SupersededError, move_tag
 
 __all__ = [
     "SCHEMA",
@@ -25,20 +38,24 @@ __all__ = [
     "Edit",
     "EvidenceError",
     "GitError",
+    "Local",
     "PromotionError",
     "Registry",
     "RegistryError",
     "Request",
     "Result",
     "SourceClasses",
+    "SupersededError",
     "__version__",
     "current",
     "evidence",
     "from_needs",
     "load",
+    "load_local",
     "missing",
     "move_tag",
     "parse",
+    "parse_local",
     "pin_text",
     "promote",
     "source_classes",

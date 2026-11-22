@@ -5,19 +5,31 @@ channel's pin is read at its tip. The tag moves to that digest only when it is t
 promoted: if another promotion landed in between, the pin holds a newer build, the tag is left to
 that promotion, and a line says so. `pin-promote tag` passes no expected digest and moves the tag
 to whatever the tip's pin holds.
+
+The registry has no compare-and-swap, so a newer promotion's tag move can still be overwritten by an
+older run's PUT: the pin is read once more just before the PUT, which narrows that window and does not
+close it. A later run, or `pin-promote tag`, moves the tag back to the tip's pin (README, "Registry tags").
 """
 
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 
-from .config import Config
+from .config import Channel, Local
 from .promote import fetch, git, pin_at, tip_config
-from .registry import RegistryError, move_tag
+from .registry import RegistryError, SupersededError, move_tag
+
+
+def _holds(repo: Path, local: Local, channel: Channel, field: str, digest: str) -> bool:
+    """Whether the branch's tip, fetched just now, still has this digest in the channel's pin."""
+    ref = fetch(repo, local)
+    pin = pin_at(repo, ref, channel)
+    return pin is not None and pin.get(field) == digest
 
 
 def follow(
     repo: Path,
-    local: Config,
+    local: Local,
     config_path: str,
     names: list[str],
     expected: dict[str, dict[str, str]] | None,
@@ -50,7 +62,19 @@ def follow(
         if digest != wanted:
             say(f"{name}: a newer promotion holds the pin ({digest}), so {image} is left to it")
             continue
-        if move_tag(target["image"], target["tag"], digest, plain_http=plain_http, token_host=target.get("token_host")):
+        try:
+            changed = move_tag(
+                target["image"],
+                target["tag"],
+                digest,
+                plain_http=plain_http,
+                token_host=target.get("token_host"),
+                current=partial(_holds, repo, local, channel, target["field"], digest),
+            )
+        except SupersededError:
+            say(f"{name}: a newer promotion holds the pin, so {image} is left to it")
+            continue
+        if changed:
             moved.append(name)
             say(f"{name}: moved {image} to {digest}")
         else:

@@ -35,7 +35,7 @@ from pathlib import Path, PurePosixPath
 from typing import NotRequired, TypedDict, cast
 
 from . import checks
-from .config import Channel, Config, ConfigError, parse, source_classes
+from .config import DIGEST, Channel, Config, ConfigError, Local, parse, source_classes
 
 SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 AUTHOR = re.compile(r"(?P<name>[^<>\n]+?) <(?P<email>[^<>\s]+)>")
@@ -105,6 +105,13 @@ def pin_text(channel: Channel, values: dict[str, str]) -> str:
     for field, pattern in fields.items():
         if not re.fullmatch(pattern, values[field]):
             raise PromotionError(f"{name}.{field}: {values[field]!r} does not match {pattern}")
+    target = channel.get("registry")
+    if target is not None and not DIGEST.fullmatch(values[target["field"]]):
+        # The tag move refuses anything else, and a pin no tag can follow must never be pushed.
+        raise PromotionError(
+            f"{name}.{target['field']}: {values[target['field']]!r} is not a sha256:<64 hex> digest,"
+            " which the registry tag needs"
+        )
     return json.dumps({field: values[field] for field in fields}) + "\n"
 
 
@@ -172,7 +179,7 @@ def _show(repo: Path, ref: str, path: str) -> str:
     return git(repo, "show", f"{ref}:{path}") + "\n"
 
 
-def tip_config(repo: Path, ref: str, config_path: str, local: Config) -> Config:
+def tip_config(repo: Path, ref: str, config_path: str, local: Local) -> Config:
     """The config as the branch's tip holds it; PromotionError when it is missing, invalid or moves the branch."""
     where = f"{config_path} at the tip of {local['branch']}"
     entry = _entry(repo, ref, config_path)
@@ -240,7 +247,7 @@ def stale_files(repo: Path, config: Config, channel: Channel, build: str, ref: s
     return "", []
 
 
-def fetch(repo: Path, config: Config) -> str:
+def fetch(repo: Path, config: Local) -> str:
     """Fetch the branch into its remote-tracking ref (nothing else changes); that ref's name."""
     remote, branch = config["remote"], config["branch"]
     git(repo, "fetch", "--quiet", remote, f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}")
@@ -334,7 +341,7 @@ def _pause(attempt: int) -> float:
 
 def promote(
     repo: Path,
-    config: Config,
+    config: Local,
     config_path: str,
     request: Request,
     *,
@@ -397,16 +404,25 @@ def promote(
                 "attempts": attempt,
                 "dry_run": False,
             }
-        fetch(repo, config)
-        if git(repo, "rev-parse", ref) == tip:
+        reason = pushed["error"] or "git gave no reason"
+        try:
+            fetch(repo, config)
+            moved_on = git(repo, "rev-parse", ref) != tip
+        except GitError as error:  # the push's own error is what the caller needs; the fetch's comes second
+            raise GitError(
+                f"the push to {config['branch']} was refused ({reason}), and fetching it again failed: {error}"
+            ) from error
+        if not moved_on:
             raise PromotionError(
                 f"the push to {config['branch']} was refused and the branch did not move,"
-                f" so trying again would change nothing: {pushed['error'] or 'git gave no reason'}"
+                f" so trying again would change nothing: {reason}"
             )
-        notes.append(f"the push was refused (attempt {attempt} of {attempts}); {config['branch']} moved, trying again")
         if attempt < attempts:
+            notes.append(
+                f"the push was refused (attempt {attempt} of {attempts}); {config['branch']} moved, trying again"
+            )
             sleep(_pause(attempt))
-    raise PromotionError(f"the push was refused {attempts} times; nothing was promoted")
+    raise PromotionError(f"the push was refused {attempts} times and nothing was promoted; the last refusal: {reason}")
 
 
 def pin_at(repo: Path, ref: str, channel: Channel) -> dict[str, object] | None:

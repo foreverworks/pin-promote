@@ -31,6 +31,23 @@ SCHEMA = 1
 NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")  # no ".": --pin CHANNEL.FIELD=VALUE splits there
 FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+# Values near a digest that a registry field's pattern must refuse (it must accept only DIGEST's values).
+NEAR_MISSES = (
+    "latest",
+    "sha256:",
+    "sha256:" + "A" * 64,
+    "sha256:" + "0" * 63,
+    "sha256:" + "0" * 65,
+    "sha256:" + "0" * 32,
+    "sha256:" + "0" * 63 + "g",
+    "sha256:" + "0" * 64 + "0",
+    "sha512:" + "0" * 64,
+    "SHA256:" + "0" * 64,
+    "0" * 64,
+    " sha256:" + "0" * 64,
+    "sha256:" + "0" * 64 + " ",
+    "sha256:" + "0" * 64 + "\n",
+)
 REGISTRY_IMAGE = re.compile(r"(?:[a-z0-9.-]+|\[::1\])(?::[0-9]+)?(?:/[a-z0-9._-]+)+")
 HOSTNAME = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]+)?")
 REGISTRY_TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
@@ -61,10 +78,15 @@ class Channel(TypedDict):
     registry: NotRequired[Registry]
 
 
-class Config(TypedDict):
+class Local(TypedDict):
+    """What the local config file supplies: where the branch is and how often a push is tried."""
+
     branch: str
     remote: str
     attempts: int
+
+
+class Config(Local):
     shared_sources: list[str]
     journal: list[str]
     channels: dict[str, Channel]
@@ -106,7 +128,30 @@ def _pathspec(value: object) -> bool:
     if plain.startswith(":") or not is_relative_path(plain.rstrip("/") or "."):
         return False
     # A pathspec that selects the whole repository (or nothing but wildcards) makes every build stale.
-    return plain.rstrip("/") not in ("", ".") and plain.strip("*") != ""
+    return plain.rstrip("/") not in ("", ".") and plain.strip("*") != "" and _glob_balanced(plain)
+
+
+def _glob_balanced(pattern: str) -> bool:
+    """Whether every '[' of a glob opens a bracket expression that closes."""
+    index, end = 0, len(pattern)
+    while index < end:
+        if pattern[index] == "[":
+            index += 1
+            if index < end and pattern[index] in "!^":
+                index += 1
+            if index < end and pattern[index] == "]":
+                index += 1  # a leading ']' is a member of the set
+            while index < end and pattern[index] != "]":
+                if pattern.startswith("[:", index) and (close := pattern.find(":]", index + 2)) != -1:
+                    index = close + 2
+                else:
+                    index += 1
+            if index >= end:
+                return False
+            index += 1
+        else:
+            index += 1
+    return True
 
 
 def _matches(path: str, spec: str) -> bool:
@@ -224,13 +269,44 @@ def _channel(name: str, raw: object, problems: list[str], config_path: str | Non
                 problems.append(f"{where}.registry.tag: a tag name")
             if not isinstance(target, str) or target not in patterns:
                 problems.append(f"{where}.registry.field: one of the channel's fields, the one holding the digest")
-            elif any(re.fullmatch(patterns[target], bad) for bad in ("latest", "sha256:", "sha256:" + "A" * 64)):
+            elif any(re.fullmatch(patterns[target], bad) for bad in NEAR_MISSES):
                 problems.append(f"{where}.registry.field: the field's pattern must accept only sha256:<64 hex> digests")
             if isinstance(image, str) and isinstance(tag, str) and isinstance(target, str):
                 channel["registry"] = {"image": image, "tag": tag, "field": target}
                 if isinstance(token_host, str):
                     channel["registry"]["token_host"] = token_host
     return channel
+
+
+def _local(data: dict[str, object], problems: list[str]) -> Local:
+    """The branch, the remote and the attempts of a config object; one source for both readers."""
+    branch = data.get("branch", "main")
+    if not isinstance(branch, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch) or ".." in branch:
+        problems.append("branch: a branch name, starting with a letter or a digit")
+        branch = "main"
+    remote = data.get("remote", "origin")
+    if not isinstance(remote, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", remote):
+        problems.append("remote: a remote name, starting with a letter or a digit")
+        remote = "origin"
+    attempts = data.get("attempts", 3)
+    if not isinstance(attempts, int) or isinstance(attempts, bool) or not 1 <= attempts <= 20:
+        problems.append("attempts: a whole number from 1 to 20")
+        attempts = 3
+    return {"branch": branch, "remote": remote, "attempts": attempts}
+
+
+def parse_local(raw: object) -> Local:
+    """The branch, remote and attempts of the local config file; every other key is the tip's business.
+
+    The local file may be older than the branch's tip config, or invalid in what it only describes:
+    a promotion reads the rest from the tip, so only what it needs to reach the tip is checked."""
+    if not isinstance(raw, dict):
+        raise ConfigError("the config must be a JSON object")
+    problems: list[str] = []
+    local = _local(cast(dict[str, object], raw), problems)
+    if problems:
+        raise ConfigError("\n".join(problems))
+    return local
 
 
 def parse(raw: object, config_path: str | None = None) -> Config:
@@ -245,18 +321,7 @@ def parse(raw: object, config_path: str | None = None) -> Config:
         problems.append(f"schema: this version reads schema {SCHEMA}, the config says {data.get('schema')!r}")
     for key in sorted(set(data) - TOP_LEVEL):
         problems.append(f"{key}: unknown key")
-    branch = data.get("branch", "main")
-    if not isinstance(branch, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch) or ".." in branch:
-        problems.append("branch: a branch name, starting with a letter or a digit")
-        branch = "main"
-    remote = data.get("remote", "origin")
-    if not isinstance(remote, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", remote):
-        problems.append("remote: a remote name, starting with a letter or a digit")
-        remote = "origin"
-    attempts = data.get("attempts", 3)
-    if not isinstance(attempts, int) or isinstance(attempts, bool) or not 1 <= attempts <= 20:
-        problems.append("attempts: a whole number from 1 to 20")
-        attempts = 3
+    local = _local(data, problems)
     shared = data.get("shared_sources", [])
     if (
         not _strings(shared)
@@ -284,6 +349,19 @@ def parse(raw: object, config_path: str | None = None) -> Config:
         pins = [c["pin"] for c in channels.values()]
         for pin in sorted({p for p in pins if pins.count(p) > 1}):
             problems.append(f"channels: two channels write {pin}")
+        for owner in channels.values():
+            if _selected(owner["pin"], cast(list[str], shared)):
+                problems.append(
+                    f"channels.{owner['name']}.pin: {owner['pin']} is inside shared_sources, so every promotion"
+                    " would make builds stale"
+                )
+            for other in channels.values():
+                if other is not owner and _selected(owner["pin"], other["sources"]):
+                    problems.append(
+                        f"channels.{owner['name']}.pin: {owner['pin']} is inside the sources of channel"
+                        f" {other['name']}, so a promotion of {owner['name']} would make its builds stale"
+                        f" (exclude it there, e.g. ':!{owner['pin']}')"
+                    )
         for pin in sorted(set(pins) & set(cast(list[str], journal))):
             problems.append(f"journal: {pin} is a channel's pin file")
         for path in cast(list[str], journal):
@@ -300,13 +378,23 @@ def parse(raw: object, config_path: str | None = None) -> Config:
     if problems:
         raise ConfigError("\n".join(problems))
     return {
-        "branch": branch,
-        "remote": remote,
-        "attempts": attempts,
+        **local,
         "shared_sources": cast(list[str], shared),
         "journal": cast(list[str], journal),
         "channels": channels,
     }
+
+
+def load_local(path: Path) -> Local:
+    """The local config file's branch, remote and attempts (see `parse_local`)."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ConfigError(f"{path}: {error}") from error
+    try:
+        return parse_local(raw)
+    except ConfigError as error:
+        raise ConfigError("\n".join(f"{path}: {line}" for line in str(error).splitlines())) from error
 
 
 def load(path: Path, relative: str | None = None) -> Config:

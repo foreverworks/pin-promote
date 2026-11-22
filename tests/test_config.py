@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from pin_promote import ConfigError, load, parse, source_classes
+from pin_promote import ConfigError, load, load_local, parse, parse_local, source_classes
 
 from .support import CONFIG
 
@@ -149,6 +149,80 @@ class Parse(unittest.TestCase):
             "registry.image",
             self.problems(changed(fields={"digest": "sha256:[0-9a-f]{64}"}, registry={**good, "image": "app:latest"})),
         )
+
+    def test_a_registry_field_must_accept_only_full_digests(self) -> None:
+        good = {"image": "registry.example.com/team/app", "tag": "stable", "field": "digest"}
+        for pattern in (
+            "sha256:[0-9a-f]+",
+            "sha256:[0-9a-f]{64,}",
+            "sha256:[0-9a-f]{32,64}",
+            "sha256:[0-9a-f]{63,64}",
+            "sha256:[0-9a-f]{64}.*",
+            "[0-9a-f]{64}",
+            "(sha256|sha512):[0-9a-f]{64}",
+            "sha256:[0-9a-fA-F]{64}",
+            "sha256:[0-9a-f]{64} ?",
+        ):
+            with self.subTest(pattern=pattern):
+                text = self.problems(changed(fields={"digest": pattern}, registry=good))
+                self.assertIn("only sha256:<64 hex>", text)
+        parse(changed(fields={"digest": "sha256:[0-9a-f]{64}"}, registry=good))
+
+    def test_a_pin_inside_another_channels_sources_or_the_shared_sources_is_refused(self) -> None:
+        def host(*sources: str, **top: object) -> dict[str, object]:
+            raw = {**CONFIG, **top}
+            raw["channels"] = {
+                "vm": CONFIG["channels"]["vm"],  # type: ignore[index]
+                "host": {**CONFIG["channels"]["host"], "sources": list(sources)},  # type: ignore[index]
+            }
+            return raw
+
+        text = self.problems(host("images/", "install/"))
+        self.assertIn("channels.vm.pin: images/vm/pin.json is inside the sources of channel host", text)
+        self.assertNotIn("channels.host.pin", text)  # its own pin is the pin class's business, not this check's
+        self.assertIn("channels.vm.pin", self.problems(host("images/v*/", "install/")))
+        self.assertIn(
+            "channels.vm.pin: images/vm/pin.json is inside shared_sources",
+            self.problems(host("install/", shared_sources=["images/vm/"])),
+        )
+        self.assertIn(
+            "channels.host.pin: images/host/pin.json is inside shared_sources",
+            self.problems(host("install/", shared_sources=["images/"])),
+        )
+        # An exclusion in the other channel's sources hides the pin: fine.
+        parse(host("images/", ":!images/*/pin.json", "install/"))
+        parse(host("images/", ":!images/vm/pin.json", "install/"))
+        parse(host("install/"))
+
+    def test_a_malformed_glob_is_refused(self) -> None:
+        for bad in ("app/[", "app/[a", "app/[]", "app/[!", "app/[[:alpha:]", "im[a-"):
+            with self.subTest(glob=bad):
+                self.assertIn("sources", self.problems(changed(sources=[bad])))
+                self.assertIn("sources", self.problems(changed(sources=["images/", ":!" + bad])))
+                self.assertIn("shared_sources", self.problems({**CONFIG, "shared_sources": [bad]}))
+        for good in ("app/[ab]*", "app/[]x]", "app/[!a]", "app/[[:alpha:]]x", "app/*.json", "a?/b"):
+            with self.subTest(glob=good):
+                parse(changed(sources=[good]))
+
+    def test_the_local_file_is_read_leniently(self) -> None:
+        self.assertEqual(
+            parse_local({"schema": 99, "channels": "nonsense", "branch": "release/1", "attempts": 5}),
+            {"branch": "release/1", "remote": "origin", "attempts": 5},
+        )
+        self.assertEqual(parse_local({}), {"branch": "main", "remote": "origin", "attempts": 3})
+        with self.assertRaisesRegex(ConfigError, "branch"):
+            parse_local({"branch": "-d"})
+        with self.assertRaisesRegex(ConfigError, "attempts"):
+            parse_local({"attempts": 0})
+        with self.assertRaisesRegex(ConfigError, "JSON object"):
+            parse_local([])
+        with TemporaryDirectory() as held:
+            path = Path(held) / "pin-promote.json"
+            path.write_text(json.dumps({"schema": 1, "channels": {}, "remote": "up"}))
+            self.assertEqual(load_local(path)["remote"], "up")
+            path.write_text("{")
+            with self.assertRaisesRegex(ConfigError, str(path)):
+                load_local(path)
 
     def test_top_level(self) -> None:
         self.assertIn("schema", self.problems({**CONFIG, "schema": 2}))

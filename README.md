@@ -131,7 +131,8 @@ In this order. Any refusal stops everything before a commit is made.
    name given with `--passed` whose job result is present and not `success` is an error, not an
    override: `smoke: the job results say failure; --passed cannot override it`.
 3. **Every new value matches its field's pattern**, and every field of the channel is given. A pin
-   is one set of values, never part of one.
+   is one set of values, never part of one. A registry field must also be a full `sha256:<64 hex>` digest,
+   or nothing is pushed.
 4. **The build's commit must be on the branch.** A build of a feature branch never promotes. If the
    commit is missing from a shallow clone, the message says the history may be shallow and to fetch
    all of it (`fetch-depth: 0` in `actions/checkout`).
@@ -177,11 +178,12 @@ did not move after the pins were pushed (the exit status is then `1`).
 
 The config **at the branch's tip** governs a promotion, read again on every attempt after the fetch.
 A required check or a shared source added to `main` after your build started is enforced for that
-older build, and a build cannot promote itself past a rule that was tightened meanwhile. The local
-file is read only to learn the `remote`, the `branch` and the number of `attempts`, so that the
-fetch knows where to go. `pin-promote check` reads the local file, so it checks what you are about
-to commit. In the library, `promote` takes the config's path inside the repository
-(`pin-promote.json`, or what `--config` names) for the same reason.
+older build, and a build cannot promote itself past a rule that was tightened meanwhile. `promote`
+and `tag` read only the `remote`, the `branch` and the number of `attempts` from the local file, so
+that the fetch knows where to go; the rest of the local file may be older or even invalid, and which
+channels exist (and which has a registry tag) is decided by the tip. `pin-promote check` and `show`
+read the whole local file, so `check` checks what you are about to commit. In the library, `promote`
+takes the config's path inside the repository (`pin-promote.json`, or what `--config` names) for the same reason.
 
 ## GitHub Actions
 
@@ -341,6 +343,14 @@ pin-promote tag --channel app
 
 `tag` fetches the branch and moves the tag to the digest the pin holds at its tip, whatever that
 is. It has no `--ref`: a tag that points anywhere but the tip's pin would disagree with git.
+
+**A race no tool can close.** A registry has no compare-and-swap: a tag is overwritten by a PUT, with
+no way to say "only if it still holds what I read". Between reading the tip's pin and the PUT, a
+newer promotion can land and move the tag to its own digest, and this run's PUT then puts the older
+digest back. pin-promote narrows the window: it fetches the branch and reads the pin once more right
+before the PUT, and leaves the tag alone if the pin changed. What remains is the time of one request.
+It heals itself: the newer promotion's own run moves the tag again, or run `pin-promote tag` (or the
+promotion again), which always follows the tip's pin.
 
 ## Supported Pythons
 
