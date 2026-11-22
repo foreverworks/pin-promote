@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Run pin-promote from a checkout: no install, standard library only."""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from pin_promote.cli import main  # noqa: E402
+
+sys.exit(main())

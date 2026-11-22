@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Build pin-promote-<version>.pyz, the release asset: one file, standard library only, run with any
+# python3 >= 3.13. Reproducible: every file carries the commit's time and zipapp adds them in order,
+# so anyone can rebuild a tag and compare the sha256 with the release's.
+#
+#   scripts/build-pyz [<output dir>]      (default: dist/)
+set -euo pipefail
+export TZ=UTC  # zip stores local times
+umask 022
+root=$(cd "$(dirname "$0")/.." && pwd)
+out=${1:-"$root/dist"}
+version=$(python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import pin_promote; print(pin_promote.__version__)' "$root/src")
+stamp=$(git -C "$root" log -1 --format=%ct)
+stage=$(mktemp -d)
+trap 'rm -rf "$stage"' EXIT
+mkdir -p "$out" "$stage/app"
+cp -r "$root/src/pin_promote" "$stage/app/"
+find "$stage/app" -name __pycache__ -prune -exec rm -rf {} +
+chmod -R u=rwX,go=rX "$stage/app"
+printf 'import sys\n\nfrom pin_promote.cli import main\n\nsys.exit(main())\n' > "$stage/app/__main__.py"
+find "$stage/app" -exec touch -h -d "@$stamp" {} +
+python3 -I -m zipapp "$stage/app" -p '/usr/bin/env python3' -o "$out/pin-promote-$version.pyz"
+(cd "$out" && sha256sum "pin-promote-$version.pyz" > "pin-promote-$version.pyz.sha256")
+echo "$out/pin-promote-$version.pyz"

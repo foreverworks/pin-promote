@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=84.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pin-promote"
+dynamic = ["version"]
+description = "Move a repository's pins only after their checks pass, and never from a build older than its sources."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.13"
+dependencies = []
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Build Tools",
+  "Topic :: Software Development :: Version Control :: Git",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/foreverworks/pin-promote"
+
+[project.scripts]
+pin-promote = "pin_promote.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "pin_promote.__version__" }
+
+[tool.setuptools.package-data]
+pin_promote = ["py.typed"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+disallow_any_explicit = true
+files = ["src", "tests", "bin/pin-promote"]
+mypy_path = "src"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+extend-exclude = ["*.md"]  # README snippets keep their aligned comments
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "N"]
+ignore = []
+
