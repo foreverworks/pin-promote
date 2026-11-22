@@ -16,6 +16,15 @@ class Checks(unittest.TestCase):
     def test_by_hand_overrides_nothing_but_adds(self) -> None:
         self.assertEqual(evidence(["lint"], {"boot": "success"}), {"boot": "success", "lint": "success"})
 
+    def test_a_name_passed_by_hand_cannot_overrule_a_job_result(self) -> None:
+        with self.assertRaisesRegex(EvidenceError, "smoke: the job results say failure; --passed cannot override it"):
+            evidence(["smoke"], {"smoke": "failure"})
+        for result in ("skipped", "cancelled"):
+            with self.assertRaisesRegex(EvidenceError, f"the job results say {result}"):
+                evidence(["boot", "smoke"], {"smoke": result})
+        self.assertEqual(evidence(["smoke"], {"smoke": "success"}), {"smoke": "success"})  # agreeing is fine
+        self.assertEqual(evidence(["smoke"], {"boot": "failure"}), {"boot": "failure", "smoke": "success"})
+
     def test_unreadable(self) -> None:
         for text in ("[", "[]", '{"boot": {}}', '{"boot": "success"}'):
             with self.assertRaises(EvidenceError):

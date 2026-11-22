@@ -2,7 +2,8 @@
 
 Evidence comes from the caller, in either form or both:
 
-* names given one by one (`--passed smoke`), for a check the calling job ran itself;
+* names given one by one (`--passed smoke`), for a check the calling job ran itself (a name the
+  job results also hold, with any result but `success`, is an error: a hand cannot overrule a CI run);
 * a CI system's job results as JSON. GitHub Actions' `toJSON(needs)` is the shape read here:
   `{"<job>": {"result": "success", "outputs": {...}}, ...}`. Only `success` counts as passed.
 
@@ -14,7 +15,7 @@ from typing import cast
 
 
 class EvidenceError(ValueError):
-    """The job results could not be read."""
+    """The job results could not be read, or they contradict a name passed by hand."""
 
 
 def from_needs(text: str) -> dict[str, str]:
@@ -35,9 +36,11 @@ def from_needs(text: str) -> dict[str, str]:
 
 
 def evidence(passed: list[str], needs: dict[str, str]) -> dict[str, str]:
-    """One {check: result} map; a name passed by hand is a success."""
+    """One {check: result} map; a name passed by hand is a success, unless the job results say otherwise."""
     out = dict(needs)
     for name in passed:
+        if name in needs and needs[name] != "success":
+            raise EvidenceError(f"{name}: the job results say {needs[name]}; --passed cannot override it")
         out[name] = "success"
     return out
 
