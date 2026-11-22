@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "branch": "main",
+  "remote": "origin",
+  "attempts": 3,
+  "shared_sources": ["lock.json"],
+  "journal": ["CHANGELOG.md"],
+  "channels": {
+    "app": {
+      "pin": "deploy/app.json",
+      "fields": {
+        "digest": "sha256:[0-9a-f]{64}"
+      },
+      "sources": ["app/", "Dockerfile"],
+      "checks": ["test", "smoke"],
+      "subject": "app: pin the verified image",
+      "note": "Tagged stable in the registry.",
+      "registry": {
+        "image": "registry.example.com/team/app",
+        "tag": "stable",
+        "field": "digest"
+      }
+    },
+    "vm-image": {
+      "pin": "deploy/vm-image.json",
+      "fields": {
+        "fingerprint": "[0-9a-f]{64}"
+      },
+      "sources": ["images/vm/", ":!images/vm/README.md"],
+      "checks": ["boot-test"]
+    }
+  }
+}
