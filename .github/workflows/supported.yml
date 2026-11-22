@@ -1,0 +1,31 @@
+# The test suite on every supported Python, 3.13 (Debian 13's) up to the newest stable. Called by
+# weekly.yml and by release.yml, where it gates the publish. One list of versions, here.
+name: supported
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests on Python ${{ matrix.python }}
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.13", "3.14", "3.15"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Tests
+        run: python -m unittest discover -s tests -t . -v

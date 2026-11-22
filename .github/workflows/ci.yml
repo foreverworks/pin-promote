@@ -1,0 +1,56 @@
+# Every push to main and every pull request: one job on the newest stable Python, with the static
+# checks run against the oldest supported one (3.13). The full matrix runs weekly and gates a release,
+# and so does this job: release.yml calls it. Nothing runs while the repository is private.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: tests on Python 3.15, types and lint at the 3.13 floor
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      - name: Lint and type tools, pinned
+        run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
+
+      - name: Lint, at the 3.13 floor (pyproject.toml target-version)
+        run: |
+          ruff check
+          ruff format --check
+
+      - name: Types, at the 3.13 floor
+        run: mypy --strict --python-version 3.13
+
+      - name: Shell
+        run: shellcheck scripts/build-pyz
+
+      - name: Tests
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: The release asset builds and runs
+        run: |
+          scripts/build-pyz
+          python3 dist/pin-promote-*.pyz --version
+          python3 dist/pin-promote-*.pyz -C . check --config examples/pin-promote.json
