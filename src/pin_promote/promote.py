@@ -182,6 +182,15 @@ def _on_branch(repo: Path, build: str, ref: str) -> bool:
     return done.returncode == 0
 
 
+def _identity(author: str | None) -> list[str]:
+    if not author:
+        return []
+    match = AUTHOR.fullmatch(author)
+    if match is None:
+        raise PromotionError(f"the author must be 'Name <email>': {author!r}")
+    return ["-c", f"user.name={match['name']}", "-c", f"user.email={match['email']}"]
+
+
 def _commit_and_push(
     repo: Path, config: Config, ref: str, changes: list[Edit], journal: str, text: str, author: str | None
 ) -> tuple[bool, str]:
@@ -200,12 +209,7 @@ def _commit_and_push(
             with target.open("a", encoding="utf-8") as handle:
                 handle.write(journal)
         git(tree, "add", "--", *[c["path"] for c in changes], *config["journal"])
-        identity: list[str] = []
-        if author:
-            match = AUTHOR.fullmatch(author)
-            if match is None:
-                raise PromotionError(f"the author must be 'Name <email>': {author!r}")
-            identity = ["-c", f"user.name={match['name']}", "-c", f"user.email={match['email']}"]
+        identity = _identity(author)
         done = subprocess.run(
             ["git", "-C", str(tree), *identity, "commit", "--quiet", "-F", "-"],
             input=text,
@@ -247,6 +251,7 @@ def promote(repo: Path, config: Config, request: Request, *, log: list[str] | No
     failed = checks.missing(required, request["results"])
     if failed:
         raise PromotionError(f"checks not passed: {', '.join(failed)}")
+    _identity(request.get("author"))
     for name in names:  # values first: a bad value is refused before any network
         pin_text(config["channels"][name], request["pins"][name])
     day = datetime.now(UTC).date().isoformat()
