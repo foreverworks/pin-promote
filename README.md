@@ -33,10 +33,11 @@ refused push from the new tip of the branch, and it never force-pushes.
 
 - **A config** (`pin-promote.json`) listing your channels: for each, the pin file, the fields it
   holds and the pattern each value must match, the paths a build must not be older than, and the
-  checks that must have passed.
+  checks that must have passed. The copy on the branch is the one that governs, see
+  [Which config governs](#which-config-governs).
 - **`pin-promote promote`**, the one command that moves pins, with the steps listed below.
-- **`check`, `show` and `tag`**: validate the config, print what the pins hold on the branch, and
-  retry a registry tag.
+- **`check`, `show` and `tag`**: validate the local config file, print what the pins hold on the
+  branch, and retry a registry tag.
 - **An optional registry tag**: after a pin moves, a tag such as `stable` is pointed at the pinned
   digest, so what the registry calls stable and what git pins cannot disagree.
 - **A single-file release**: `pin-promote-X.Y.Z.pyz` and its checksum, one file for any Python 3.13
@@ -94,8 +95,9 @@ $ pin-promote show
 `check` exits 1 and lists every problem if the config is wrong. `show` prints each pin as the
 remote branch holds it (`null`: no pin file yet).
 
-**4. Try a promotion without committing anything.** Push the commit you built from to `main`
-first: pin-promote only promotes builds that are on the branch.
+**4. Try a promotion without committing anything.** Commit the config and push it, with the commit
+you built from, to `main` first: pin-promote only promotes builds that are on the branch, and it
+reads the config from the branch's tip, not from your working copy.
 
 ```sh
 pin-promote promote --dry-run \
@@ -119,24 +121,40 @@ entry), pushes it, and your deploy reads `deploy/app.json`.
 
 In this order. Any refusal stops everything before a commit is made.
 
-1. **Every check the named channels require has passed.** Evidence is `--passed NAME` for a check
+1. **The branch is fetched, and the config is read from its tip** (`git show <tip>:pin-promote.json`).
+   Everything below uses that config: its checks, fields, sources, journal, subject and registry
+   block. It is refused if the config is missing or invalid there, or if its `branch` or `remote`
+   differ from the local config's. See [Which config governs](#which-config-governs).
+2. **Every check the named channels require has passed.** Evidence is `--passed NAME` for a check
    your job ran itself, and `--needs-json` / `--needs-file` for a CI system's job results. Only a
-   result of `success` counts: `failure`, `cancelled`, `skipped` and a job that never ran do not.
-2. **Every new value matches its field's pattern**, and every field of the channel is given. A pin
+   result of `success` counts: `failure`, `cancelled`, `skipped` and a job that never ran do not. A
+   name given with `--passed` whose job result is present and not `success` is an error, not an
+   override: `smoke: the job results say failure; --passed cannot override it`.
+3. **Every new value matches its field's pattern**, and every field of the channel is given. A pin
    is one set of values, never part of one.
-3. **The branch is fetched, and the build's commit must be on it.** A build of a feature branch
-   never promotes.
-4. **A channel whose pin already holds these values is unchanged.** A retry commits nothing.
-5. **For every channel that changes, the build is not stale.** No file in that channel's `sources`,
-   the config's `shared_sources` or the channel's own pin file may differ between the build's
-   commit and the branch's tip. If one does, someone changed what this build was made from, or
-   promoted a newer build, since it started: the whole promotion is refused.
-6. **The pins are written in a temporary worktree** of the branch's tip, with one journal entry per
-   `journal` file, committed and pushed. Your own checkout is never touched. The push is never
-   forced: if the remote refuses it because the branch moved, pin-promote fetches again and repeats
-   steps 3 to 6 from the new tip, up to `attempts` times (3 by default).
-7. **The registry tag follows the pin**, for a channel with a `registry` block: see
+4. **The build's commit must be on the branch.** A build of a feature branch never promotes. If the
+   commit is missing from a shallow clone, the message says the history may be shallow and to fetch
+   all of it (`fetch-depth: 0` in `actions/checkout`).
+5. **A channel whose pin already holds these values is unchanged.** A retry commits nothing.
+6. **For every channel that changes, the build is not stale.** Three questions, each asked of git
+   separately (`git diff --name-only <build> <tip> -- <paths>`), and a changed file in any of them
+   refuses the whole promotion:
+   - the channel's own `sources` (its `:!` exclusions apply here and nowhere else),
+   - the config's `shared_sources` (no exclusions),
+   - the channel's own pin file, as a literal path.
+
+   Someone changed what this build was made from, or promoted a newer build, since it started.
+7. **The pins are written in a temporary worktree** of the branch's tip, with one journal entry per
+   `journal` file, committed and pushed. The push is never forced. A pin or journal path that
+   passes through a symlink on the branch is refused, so nothing is written outside the repository.
+   Your own checkout is never touched: its working tree, index and `HEAD` stay as they were (the
+   fetch updates the remote-tracking ref, `refs/remotes/<remote>/<branch>`, and nothing else). If
+   the push is refused, see [Retry, and dispatch after](#retry-and-dispatch-after).
+8. **The registry tag follows the pin**, for a channel with a `registry` block: see
    [Registry tags](#registry-tags).
+
+If the run is cancelled (SIGTERM, as a CI system sends it), the temporary worktree is removed
+before the command exits.
 
 The commit looks like this, and the journal gets the same facts as a short entry:
 
@@ -152,7 +170,18 @@ Checks passed: test, smoke
 
 Exit status: `0` promoted or nothing to do, `1` refused or failed (the message says which, on
 standard error), `2` a usage error. `--json` prints the result as one JSON object with `commit`,
-`promoted`, `unchanged`, `attempts`, `dry_run` and `tags_moved`.
+`promoted`, `unchanged`, `attempts`, `dry_run` and `tags_moved`, and `tag_error` when a registry tag
+did not move after the pins were pushed (the exit status is then `1`).
+
+### Which config governs
+
+The config **at the branch's tip** governs a promotion, read again on every attempt after the fetch.
+A required check or a shared source added to `main` after your build started is enforced for that
+older build, and a build cannot promote itself past a rule that was tightened meanwhile. The local
+file is read only to learn the `remote`, the `branch` and the number of `attempts`, so that the
+fetch knows where to go. `pin-promote check` reads the local file, so it checks what you are about
+to commit. In the library, `promote` takes the config's path inside the repository
+(`pin-promote.json`, or what `--config` names) for the same reason.
 
 ## GitHub Actions
 
@@ -265,9 +294,12 @@ step then runs again, which is what you want: the deploy has to happen even when
 make the commit. Keep the deploy idempotent (deploying the pinned digest twice changes nothing) and
 put the dispatch after promote, unconditionally.
 
-If the remote refuses the push because the branch moved while the job ran, pin-promote retries it
-from the branch's new tip by itself, and checks staleness again on the way, so a retry cannot
-slip a stale build through.
+If the remote refuses the push **and the branch moved** while the job ran, pin-promote waits (1
+second, then 2, then 4, at most 8) and tries again from the branch's new tip by itself. It reads
+the config and checks staleness again on the way, so a retry cannot slip a stale build through.
+A push that is refused while the branch stood still (a hook, missing permission, a protected
+branch) fails at once, with git's own message in the error, because trying again would change
+nothing.
 
 ## Registry tags
 
@@ -279,23 +311,36 @@ the branch:
 "registry": { "image": "registry.example.com/team/app", "tag": "stable", "field": "digest" }
 ```
 
-The tag follows the pin, never the other way around. pin-promote reads the manifest by digest,
-checks that its bytes hash to that digest, and puts the same bytes under the tag. If the tag is
-already there, it does nothing, so running it again is harmless.
+The tag follows the pin, never the other way around, and **the pin as the branch's tip holds it
+now**: after the push (and after a run that found the pin unchanged), the branch is fetched again
+and the pin is read there. The tag moves only if that digest is the one this run promoted. If a
+newer promotion landed in between, pin-promote prints that a newer promotion holds the pin and
+leaves the tag to it. It reads the manifest by digest, checks that its bytes hash to that digest,
+and puts the same bytes under the tag. If the tag is already there, it does nothing, so running it
+again is harmless. The whole move has one deadline of 120 seconds, across all its requests.
 
 Credentials are the environment variables `PIN_PROMOTE_REGISTRY_USERNAME` and
 `PIN_PROMOTE_REGISTRY_PASSWORD`; for GitHub's registry, the actor and a token with `packages: write`
-as in the example. They are sent only to the registry, or to the token service its challenge names,
-over https. A registry that redirects is an error: a redirect would carry the credentials somewhere
-else. For a local test registry on plain http, pass `--plain-http`.
+as in the example. They are sent only over https, and only to the registry or to its token service:
 
-If the tag move fails (the registry was down), the pin is already on the branch, and promote exits
-1. Run the job again: the pin is unchanged, and the tag is moved. Or move only the tag, which needs
-no new build:
+- A registry that redirects is an error: a redirect would carry the credentials somewhere else.
+- A bearer challenge names a token service (a `realm`). Its host must be the registry's own host.
+  If your registry hands out tokens from another host, name that one host in the channel's
+  registry block, `"token_host": "auth.example.com"`, and nothing else is trusted.
+- Plain http is for a registry on this machine only (`localhost`, `127.0.0.1` or `[::1]`): pass
+  `--plain-http` for a local test registry. For any other host it is refused.
+
+If the tag move fails (the registry was down), the pin is already on the branch. promote prints the
+result as usual (under `--json`, with a `tag_error` field), says on standard error that the pins
+are on the branch, and exits 1. Run the job again: the pin is unchanged, and the tag is moved. Or
+move only the tag, which needs no new build:
 
 ```sh
 pin-promote tag --channel app
 ```
+
+`tag` fetches the branch and moves the tag to the digest the pin holds at its tip, whatever that
+is. It has no `--ref`: a tag that points anywhere but the tip's pin would disagree with git.
 
 ## Supported Pythons
 
@@ -328,6 +373,7 @@ config = load(repo / "pin-promote.json")
 result = promote(
     repo,
     config,
+    "pin-promote.json",  # the config's path inside the repository; the copy at the branch's tip governs
     {
         "build": "2380cfdfdd52ac34c30f797a250094e4f0ec25bc",
         "pins": {"app": {"digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}},
@@ -337,7 +383,9 @@ result = promote(
 )
 ```
 
-`PromotionError` means refused, with nothing pushed; `ConfigError` means the config is wrong.
+`PromotionError` means refused, with nothing pushed; `ConfigError` means the config is wrong. The
+registry tag has its own call, `pin_promote.tags.follow`, which `pin-promote promote` makes after
+`promote`. `promote` takes an optional `sleep` function for the pause between retries.
 
 ## License
 
