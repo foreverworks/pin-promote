@@ -134,7 +134,15 @@ def main(argv: list[str] | None = None) -> int:
         tags: list[str] = []
         if not result["dry_run"]:
             # After the pin is on the branch, and on a retry that changed nothing: the tag follows the pin.
-            tags = _tags(config, repo, list(request["pins"]), result["commit"], args.plain_http, log := [])
+            try:
+                tags = _tags(config, repo, list(request["pins"]), result["commit"], args.plain_http, log := [])
+            except registry.RegistryError as error:
+                print(
+                    f"failed: the pins are on {config['branch']} in {result['commit']}, but a registry tag did not"
+                    f" move: {error}. Run this promotion again, or `pin-promote tag --channel <name>`.",
+                    file=sys.stderr,
+                )
+                return 1
             for line in log:
                 print(line, file=sys.stderr)
         if args.json:

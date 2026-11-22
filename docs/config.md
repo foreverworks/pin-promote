@@ -49,9 +49,8 @@ A complete example is [examples/pin-promote.json](../examples/pin-promote.json).
 ## Channels
 
 A channel is one pin file, and the rules for moving it. Its name is the key in `channels`: lower
-case letters, digits, `.`, `_` and `-`, starting with a letter or a digit. The command line names a
-pin as `CHANNEL.FIELD=VALUE` and splits at the first `.`, so give a channel a name without a `.`
-(`vm-image`, not `vm.image`).
+case letters, digits, `_` and `-`, starting with a letter or a digit. There is no `.` in it because
+the command line names a pin as `CHANNEL.FIELD=VALUE` (`vm-image.fingerprint=...`).
 
 | Key | Type | Default | Rule |
 |---|---|---|---|
@@ -65,8 +64,8 @@ pin as `CHANNEL.FIELD=VALUE` and splits at the first `.`, so give a channel a na
 
 ### Fields
 
-`fields` lists what the pin file holds. Each key is a field name: ASCII letters, digits and `_`
-(and `.` or `-` after the first character), starting with a letter or a digit. Each value is a
+`fields` lists what the pin file holds. Each key is a field name: ASCII letters, digits and `_`,
+not starting with a digit. Each value is a
 regular expression in Python's `re` syntax. A value passed with `--pin` must match it from its
 first character to its last (`re.fullmatch`), so `sha256:[0-9a-f]{64}` accepts exactly a lower case
 digest and nothing around it. The expression must compile, and must not match the empty string.

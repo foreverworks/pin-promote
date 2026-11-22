@@ -27,7 +27,8 @@ from pathlib import Path, PurePosixPath
 from typing import NotRequired, TypedDict, cast
 
 SCHEMA = 1
-NAME = re.compile(r"[a-z0-9][a-z0-9._-]*")
+NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")  # no ".": --pin CHANNEL.FIELD=VALUE splits there
+FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 REGISTRY_IMAGE = re.compile(r"[a-z0-9.-]+(?::[0-9]+)?(?:/[a-z0-9._-]+)+")
 REGISTRY_TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
@@ -90,7 +91,7 @@ def _strings(value: object) -> bool:
 def _channel(name: str, raw: object, problems: list[str]) -> Channel | None:
     where = f"channels.{name}"
     if not NAME.fullmatch(name):
-        problems.append(f"{where}: a channel name is lower case letters, digits, '.', '_' and '-'")
+        problems.append(f"{where}: a channel name is lower case letters, digits, '_' and '-'")
     if not isinstance(raw, dict):
         problems.append(f"{where}: must be an object")
         return None
@@ -106,8 +107,10 @@ def _channel(name: str, raw: object, problems: list[str]) -> Channel | None:
         problems.append(f"{where}.fields: an object of field name -> pattern, at least one")
     else:
         for field, pattern in cast(dict[str, object], fields).items():
-            if not NAME.fullmatch(field.replace("_", "-").lower()) or not field.isascii():
-                problems.append(f"{where}.fields.{field}: a field name is ASCII letters, digits and '_'")
+            if not FIELD.fullmatch(field):
+                problems.append(
+                    f"{where}.fields.{field}: a field name is ASCII letters, digits and '_', not first a digit"
+                )
             if not isinstance(pattern, str) or not pattern:
                 problems.append(f"{where}.fields.{field}: the pattern must be a non-empty string")
                 continue
