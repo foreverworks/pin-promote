@@ -90,9 +90,13 @@ did.
 one of those prefixed with `:!` (or `:^`) to exclude it (`:!app/README.md`).
 
 - **Globs** are git's pathspec globs: `*`, `?` and `[...]` are wildcards, and `*` also matches `/`
-  (`images/*.sh`, `*.lock`, `img[12]/`). Other pathspec magic, such as `:(glob)` or `:(top)`, is
-  refused, because it changes what a path means. A malformed glob is refused too: a `[` that is never
-  closed (`app/[`, `img[12`).
+  (`images/*.sh`, `*.lock`, `img[12]/*`). A glob is matched against the whole path, as git does: it
+  never selects "everything below" a directory it matches, so `img[12]` or `img[12]/` selects no file,
+  and `:!images/?` does not exclude `images/a/pin.json`. Write `img[12]/*` and `:!images/?/*`. In a
+  bracket expression `[^x]` and `[!x]` both negate; POSIX classes (`[[:upper:]]`) and ranges that run
+  backwards (`[z-a]`) are refused. Other pathspec magic, such as `:(glob)` or `:(top)`, is refused,
+  because it changes what a path means. A malformed glob is refused too: a `[` that is never closed
+  (`app/[`, `img[12`).
 - **Everything** is refused: `.`, `./`, an empty path after the exclusion prefix (`:!`), `:!.` and a
   pathspec made only of `*`. A source that selects the whole repository would make every build stale.
   List the directories that matter.

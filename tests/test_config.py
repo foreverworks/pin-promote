@@ -66,9 +66,31 @@ class Parse(unittest.TestCase):
         self.assertIn(".sources", self.problems(changed(sources=[""])))
 
     def test_globs_are_allowed_in_sources_and_shared_sources(self) -> None:
-        config = parse({**changed(sources=["images/*.sh", "img[12]/", "a?c"]), "shared_sources": ["*.lock", "x/**"]})
-        self.assertEqual(config["channels"]["vm"]["sources"], ["images/*.sh", "img[12]/", "a?c"])
+        config = parse({**changed(sources=["images/*.sh", "img[12]/*", "a?c"]), "shared_sources": ["*.lock", "x/**"]})
+        self.assertEqual(config["channels"]["vm"]["sources"], ["images/*.sh", "img[12]/*", "a?c"])
         self.assertEqual(config["shared_sources"], ["*.lock", "x/**"])
+
+    def test_brackets_are_refused_where_git_and_python_disagree(self) -> None:
+        for spec in ("app/[[:upper:]]*", "app/[a[:digit:]]", "img[z-a]/*"):
+            with self.subTest(spec=spec):
+                self.assertIn(".sources", self.problems(changed(sources=["images/", spec])))
+        parse(changed(sources=["images/", ":!images/host/", "app/[^b]*", "app/[!b]*", "app/[]a]*", "app/[a-c-]*"]))
+
+    def test_an_exclusion_by_a_glob_that_git_reads_differently_does_not_hide_a_pin(self) -> None:
+        # git excludes only what the glob matches whole: ':!images/?' leaves images/a/pin.json in the sources.
+        def host(*sources: str) -> dict[str, object]:
+            return {
+                **CONFIG,
+                "channels": {
+                    "vm": CONFIG["channels"]["vm"],  # type: ignore[index]
+                    "host": {**CONFIG["channels"]["host"], "sources": list(sources)},  # type: ignore[index]
+                },
+            }
+
+        for exclusion in (":!images/?", ":!images/[ab]", ":!images/*/x"):
+            with self.subTest(exclusion=exclusion):
+                self.assertIn("images/vm/pin.json is inside", self.problems(host("images/", exclusion)))
+        parse(host("images/", ":!images/*/pin.json"))
 
     def test_shared_sources_have_no_exclusions(self) -> None:
         text = self.problems({**CONFIG, "shared_sources": ["lock.json", ":!lock.json"]})
@@ -110,7 +132,7 @@ class Parse(unittest.TestCase):
         self.assertIn(
             "inside shared_sources", self.problems({**CONFIG, "shared_sources": ["*.lock"], "journal": ["a/b.lock"]})
         )
-        self.assertIn("sources of channel vm", self.problems(journal("images/log.md", sources=["im*/"])))
+        self.assertIn("sources of channel vm", self.problems(journal("images/log.md", sources=["im*"])))
         self.assertIn("sources of channel vm", self.problems(journal("images/vm", sources=["images/vm/"])))
         # Outside, or excluded from the channel's own sources: fine.
         parse(journal("CHANGELOG.md", "docs/log.md"))
@@ -180,7 +202,7 @@ class Parse(unittest.TestCase):
         text = self.problems(host("images/", "install/"))
         self.assertIn("channels.vm.pin: images/vm/pin.json is inside the sources of channel host", text)
         self.assertNotIn("channels.host.pin", text)  # its own pin is the pin class's business, not this check's
-        self.assertIn("channels.vm.pin", self.problems(host("images/v*/", "install/")))
+        self.assertIn("channels.vm.pin", self.problems(host("images/v*", "install/")))
         self.assertIn(
             "channels.vm.pin: images/vm/pin.json is inside shared_sources",
             self.problems(host("install/", shared_sources=["images/vm/"])),
@@ -200,7 +222,10 @@ class Parse(unittest.TestCase):
                 self.assertIn("sources", self.problems(changed(sources=[bad])))
                 self.assertIn("sources", self.problems(changed(sources=["images/", ":!" + bad])))
                 self.assertIn("shared_sources", self.problems({**CONFIG, "shared_sources": [bad]}))
-        for good in ("app/[ab]*", "app/[]x]", "app/[!a]", "app/[[:alpha:]]x", "app/*.json", "a?/b"):
+        for refused in ("app/[[:alpha:]]x", "app/[x[:alpha:]]"):  # git's classes: not translated, so not accepted
+            with self.subTest(glob=refused):
+                self.assertIn("sources", self.problems(changed(sources=[refused])))
+        for good in ("app/[ab]*", "app/[]x]", "app/[!a]", "app/[^a]", "app/*.json", "a?/b"):
             with self.subTest(glob=good):
                 parse(changed(sources=[good]))
 

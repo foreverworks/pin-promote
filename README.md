@@ -342,7 +342,9 @@ pin-promote tag --channel app
 ```
 
 `tag` fetches the branch and moves the tag to the digest the pin holds at its tip, whatever that
-is. It has no `--ref`: a tag that points anywhere but the tip's pin would disagree with git.
+is. It has no `--ref`: a tag that points anywhere but the tip's pin would disagree with git. If the
+config at the tip has no registry for the channel, `tag` exits 1 with `failed: ...` (a refusal, not
+a usage error, which is exit 2).
 
 **A race no tool can close.** A registry has no compare-and-swap: a tag is overwritten by a PUT, with
 no way to say "only if it still holds what I read". Between reading the tip's pin and the PUT, a

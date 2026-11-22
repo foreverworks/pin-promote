@@ -21,7 +21,7 @@ Parsing is pure: `parse` takes the decoded JSON and returns a checked `Config`, 
 `ConfigError` naming every problem it found.
 """
 
-import fnmatch
+import functools
 import json
 import re
 from pathlib import Path, PurePosixPath
@@ -116,8 +116,8 @@ def _file_path(value: object) -> bool:
     return is_relative_path(value) and all(part.casefold() != ".git" for part in PurePosixPath(str(value)).parts)
 
 
-def _plain(spec: str) -> str:
-    return (spec[2:] if spec.startswith(EXCLUDE) else spec).rstrip("/")
+def _unprefixed(spec: str) -> str:
+    return spec[2:] if spec.startswith(EXCLUDE) else spec
 
 
 def _pathspec(value: object) -> bool:
@@ -128,11 +128,17 @@ def _pathspec(value: object) -> bool:
     if plain.startswith(":") or not is_relative_path(plain.rstrip("/") or "."):
         return False
     # A pathspec that selects the whole repository (or nothing but wildcards) makes every build stale.
-    return plain.rstrip("/") not in ("", ".") and plain.strip("*") != "" and _glob_balanced(plain)
+    if plain.rstrip("/") in ("", ".") or plain.strip("*") == "" or not _glob_balanced(plain):
+        return False
+    try:
+        _glob_regex(plain)
+    except re.error:  # a reversed range such as '[z-a]'
+        return False
+    return True
 
 
 def _glob_balanced(pattern: str) -> bool:
-    """Whether every '[' of a glob opens a bracket expression that closes."""
+    """Whether every '[' of a glob opens a bracket expression that closes, without a POSIX class ('[:upper:]')."""
     index, end = 0, len(pattern)
     while index < end:
         if pattern[index] == "[":
@@ -142,10 +148,9 @@ def _glob_balanced(pattern: str) -> bool:
             if index < end and pattern[index] == "]":
                 index += 1  # a leading ']' is a member of the set
             while index < end and pattern[index] != "]":
-                if pattern.startswith("[:", index) and (close := pattern.find(":]", index + 2)) != -1:
-                    index = close + 2
-                else:
-                    index += 1
+                if pattern.startswith("[:", index):
+                    return False  # git reads '[:alpha:]' as a character class, Python's fnmatch does not
+                index += 1
             if index >= end:
                 return False
             index += 1
@@ -154,12 +159,40 @@ def _glob_balanced(pattern: str) -> bool:
     return True
 
 
+@functools.cache
+def _glob_regex(pattern: str) -> re.Pattern[str]:
+    """git's wildmatch without WM_PATHNAME, which is how a pathspec glob is matched: '*' and '?' cross '/',
+    '[!x]' and '[^x]' both negate, a leading ']' is a member. Raises re.error for a reversed range."""
+    out: list[str] = []
+    index, end = 0, len(pattern)
+    while index < end:
+        char = pattern[index]
+        index += 1
+        if char == "*":
+            out.append(".*")
+        elif char == "?":
+            out.append(".")
+        elif char == "[":
+            negate = index < end and pattern[index] in "!^"
+            index += negate
+            close = pattern.index("]", index + 1 if index < end and pattern[index] == "]" else index)
+            members = pattern[index:close]
+            index = close + 1
+            last = len(members) - 1
+            body = "".join("-" if c == "-" and 0 < i < last else re.escape(c) for i, c in enumerate(members))
+            out.append(f"[{'^' if negate else ''}{body}]")
+        else:
+            out.append(re.escape(char))
+    return re.compile("".join(out), re.DOTALL)
+
+
 def _matches(path: str, spec: str) -> bool:
-    """Whether `path` is inside the file or directory `spec` selects (globs as git pathspec globs)."""
-    plain = _plain(spec)
-    if any(char in plain for char in GLOB):
-        parts = PurePosixPath(path).parts
-        return any(fnmatch.fnmatchcase("/".join(parts[:i]), plain) for i in range(1, len(parts) + 1))
+    """Whether `path` is selected by `spec`, as `git diff -- <spec>` selects it: a spec with a wildcard is
+    matched against the whole path only, any other is a file or a directory that holds the path."""
+    unprefixed = _unprefixed(spec)
+    if any(char in unprefixed for char in GLOB):
+        return _glob_regex(unprefixed).fullmatch(path) is not None
+    plain = unprefixed.rstrip("/")
     return path == plain or path.startswith(plain + "/")
 
 

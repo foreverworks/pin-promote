@@ -10,7 +10,9 @@
 `check` and `show` read the local config file; `promote` and `tag` read only its `remote`, `branch` and
 `attempts`, and take everything else from the config at the branch's tip.
 
-Exit status: 0 done (or nothing to do), 1 refused or failed, 2 a usage error.
+Exit status: 0 done (or nothing to do), 1 refused or failed, 2 a usage error. `tag` on a branch whose tip
+has no registry for the channel exits 1 ("failed: ..."), not 2: the arguments were fine, the tip's config
+cannot serve them.
 """
 
 import argparse
