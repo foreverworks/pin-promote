@@ -84,7 +84,9 @@ channel, `app`, whose pin is `deploy/app.json`:
 paths the image is built from. `checks` are the names of the checks that must have passed. Every
 key is explained in [docs/config.md](docs/config.md).
 
-**3. Check it.**
+**3. Check it.** `show` reads the branch as your clone last fetched it, so it needs a remote named
+`origin` that already has the branch (step 4 pushes the config there). If you have not pushed yet,
+run `check` now and `show` after step 4's push, with `git fetch` first.
 
 ```sh
 $ pin-promote check
@@ -163,7 +165,7 @@ If the run is cancelled (SIGTERM, as a CI system sends it), the temporary worktr
 before the command exits.
 
 With the quick start's config the commit looks like this (the digest is shortened here; a `subject`
-in the channel changes the first line), and the journal gets the same facts as a short entry:
+in the channel changes the first line, and the `Run:` line appears only when you pass `--run-url`), and the journal gets the same facts as a short entry:
 
 ```text
 app: pin the verified build
@@ -378,7 +380,8 @@ failures print `failed: ...` and also exit 1. The messages people meet, and what
 | `refused: app: every field is given at once; missing: ...` | Give every field of the channel in the same run, one `--pin` each. |
 | `refused: no such channel: web` | The config at the branch's tip has no such channel. Commit and push the config before promoting. |
 | `refused: pin-promote.json at the tip of main: the config is missing there` | The config must be on the branch: pin-promote reads the branch's copy, not your working copy. |
-| `refused: the author must be 'Name <email>'`, or git's `Please tell me who you are` | A CI runner has no git identity. Pass `--author "Name <email>"`. |
+| `refused: the author must be 'Name <email>'` | The `--author` value is malformed. Write it as `--author "Name <email>"`. |
+| `failed: git commit: Author identity unknown` | The machine has no git identity, as on a CI runner. Pass `--author "Name <email>"`. |
 | `refused: the push to main was refused and the branch did not move ...: <git's reason>` | Branch protection, a hook or a missing permission refused the push. Let the promoting identity push, or keep pins on a branch of their own (`"branch": "pins"`). |
 | `refused: the push was refused 3 times and nothing was promoted` | The branch kept moving. Run the job again, or raise `attempts` in the config. |
 | `failed: the pins are on main in <sha>, but a registry tag did not move: ...` | The pin is committed; only the tag failed. Run the job again, or `pin-promote tag --channel app`. |
