@@ -7,9 +7,12 @@ one step that changes it, so a pin can only ever point at something that was tes
 go backwards.
 
 For teams whose CI builds an artifact, tests it, and then records "this one is good" in git so a
-deploy can read it.
+deploy can read it. It is not for pins that live outside git (a cloud console, a parameter store):
+pin-promote writes a JSON file in your repository and nothing else.
 
-Python standard library only. Typed. MIT.
+You need git, Python 3.13 or newer, and a branch the promoting job may push to. A registry login is
+needed only if you want the optional registry tag. It uses only the standard library, and it is free
+(MIT).
 
 ## The problem
 
@@ -93,7 +96,9 @@ $ pin-promote show
 ```
 
 `check` exits 1 and lists every problem if the config is wrong. `show` prints each pin as the
-remote branch holds it (`null`: no pin file yet).
+remote branch held it when you last fetched (`null`: no pin file yet); in a clone that has never
+fetched the branch it fails with `Not a valid object name refs/remotes/origin/main`, so run
+`git fetch` first.
 
 **4. Try a promotion without committing anything.** Commit the config and push it, with the commit
 you built from, to `main` first: pin-promote only promotes builds that are on the branch, and it
@@ -157,10 +162,11 @@ In this order. Any refusal stops everything before a commit is made.
 If the run is cancelled (SIGTERM, as a CI system sends it), the temporary worktree is removed
 before the command exits.
 
-The commit looks like this, and the journal gets the same facts as a short entry:
+With the quick start's config the commit looks like this (the digest is shortened here; a `subject`
+in the channel changes the first line), and the journal gets the same facts as a short entry:
 
 ```text
-app: pin the verified image
+app: pin the verified build
 
 app: digest `sha256:0123...cdef`
 
@@ -354,6 +360,33 @@ before the PUT, and leaves the tag alone if the pin changed. What remains is the
 It heals itself: the newer promotion's own run moves the tag again, or run `pin-promote tag` (or the
 promotion again), which always follows the tip's pin.
 
+## When something fails
+
+Refusals print `refused: ...` on standard error and exit 1, and nothing is committed. Other
+failures print `failed: ...` and also exit 1. The messages people meet, and what to do:
+
+| You see | What it means, and what to do |
+|---|---|
+| `refused: checks not passed: smoke (not run)` | The job results or `--passed` have no entry named `smoke`. The names in `checks` are job ids: make sure the promote job `needs` that job, or pass `--passed smoke` for a check it ran itself. |
+| `refused: checks not passed: smoke (failure)` | That check did not succeed (`skipped` and `cancelled` count as failed). Fix the check and run the pipeline again. |
+| `refused: smoke: the job results say failure; --passed cannot override it` | A name given with `--passed` has a job result that is not `success`. Drop the `--passed`. |
+| `refused: app: the build is older than its sources on main: app/a.txt` | A file the build was made from changed on the branch after it started. Build again from the branch's tip. This is the check working, not an outage. |
+| `refused: app: the build is older than its pin on main: deploy/app.json` | A newer build has already moved this pin. Nothing to do. |
+| `refused: the build's commit <sha> is not on main; the history may be shallow ...` | The build is of another branch, or the checkout is shallow. In `actions/checkout` set `fetch-depth: 0`. |
+| `refused: the build's commit must be a full hex object name` | Pass the full 40-character commit id (`git rev-parse HEAD`, `$GITHUB_SHA`), not an abbreviation. |
+| `refused: app.digest: '...' does not match sha256:[0-9a-f]{64}` | The value given to `--pin` does not fit the field's pattern. An empty variable is the usual cause: check that the build job's output reached the promote job. |
+| `refused: app: every field is given at once; missing: ...` | Give every field of the channel in the same run, one `--pin` each. |
+| `refused: no such channel: web` | The config at the branch's tip has no such channel. Commit and push the config before promoting. |
+| `refused: pin-promote.json at the tip of main: the config is missing there` | The config must be on the branch: pin-promote reads the branch's copy, not your working copy. |
+| `refused: the author must be 'Name <email>'`, or git's `Please tell me who you are` | A CI runner has no git identity. Pass `--author "Name <email>"`. |
+| `refused: the push to main was refused and the branch did not move ...: <git's reason>` | Branch protection, a hook or a missing permission refused the push. Let the promoting identity push, or keep pins on a branch of their own (`"branch": "pins"`). |
+| `refused: the push was refused 3 times and nothing was promoted` | The branch kept moving. Run the job again, or raise `attempts` in the config. |
+| `failed: the pins are on main in <sha>, but a registry tag did not move: ...` | The pin is committed; only the tag failed. Run the job again, or `pin-promote tag --channel app`. |
+| `the registry wants credentials` | Set `PIN_PROMOTE_REGISTRY_USERNAME` and `PIN_PROMOTE_REGISTRY_PASSWORD`. |
+| `the registry's token service is on 'auth.example.com', not on ...` | The registry hands out tokens from another host. If you trust it, name it as `token_host` in the channel's `registry` block. |
+| `failed: app: no registry tag is configured at the tip of main` | `pin-promote tag` needs a `registry` block on that channel on the branch. |
+| `pin-promote.json: channels.app.chekcs: unknown key` | A config problem. Each line starts with the file and the key. [docs/config.md](docs/config.md) explains every key. |
+
 ## Supported Pythons
 
 3.13, 3.14 and 3.15. Every push is tested on 3.15, the newest stable release, with the lint and the
@@ -398,6 +431,13 @@ result = promote(
 `PromotionError` means refused, with nothing pushed; `ConfigError` means the config is wrong. The
 registry tag has its own call, `pin_promote.tags.follow`, which `pin-promote promote` makes after
 `promote`. `promote` takes an optional `sleep` function for the pause between retries.
+
+## Questions and bug reports
+
+Open an issue at https://github.com/foreverworks/pin-promote/issues. Say the version
+(`pin-promote --version`), the command you ran and the message you got, with any private URL taken
+out. For a security problem, please use the repository's private vulnerability reporting (Security
+tab) instead of a public issue.
 
 ## License
 
